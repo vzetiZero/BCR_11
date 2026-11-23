@@ -31,6 +31,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bridge: Bridge
     private lateinit var runner: Runner
     private lateinit var panel: ControlPanel
+    private lateinit var navBar: NavBar
     private lateinit var prefs: SitePrefs
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -122,6 +123,16 @@ class MainActivity : AppCompatActivity() {
         runner.autoPlace = true
         panel.setConfigDefaults(Runner.BASE_UNIT, Method.DEFAULT_LADDER.size)
 
+        // Thanh điều hướng nổi: WebView chạy full màn hình nên cần nút lùi/tiến/tải lại/về nhà.
+        navBar = NavBar(this).apply {
+            onBack = { if (webView.canGoBack()) webView.goBack(); updateNavState() }
+            onForward = { if (webView.canGoForward()) webView.goForward(); updateNavState() }
+            onReload = { webView.reload() }
+            onHome = {
+                val home = prefs.siteUrl.ifBlank { SitePrefs.DEFAULT_SITE }
+                webView.loadUrl(home)
+            }
+        }
         root.addView(
             panel,
             FrameLayout.LayoutParams(
@@ -129,11 +140,27 @@ class MainActivity : AppCompatActivity() {
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         )
+        // Thêm SAU panel để thanh điều hướng luôn nằm trên cùng, không bị panel che.
+        root.addView(
+            navBar,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                android.view.Gravity.START or android.view.Gravity.TOP
+            ).apply { setMargins(dp(4), 0, 0, 0) }
+        )
         setContentView(root)
         render(runner.status())
         val start = prefs.resumeUrl()
         panel.setSiteUrl(if (start.isBlank()) prefs.siteUrl else start)
         if (start.isBlank()) askSiteUrl() else webView.loadUrl(start)
+        updateNavState()
+    }
+
+    /** Bật/tắt nút lùi/tiến của thanh điều hướng theo lịch sử WebView. */
+    private fun updateNavState() {
+        if (!::navBar.isInitialized) return
+        navBar.setNavState(webView.canGoBack(), webView.canGoForward())
     }
 
     /** Ghi nhớ cặp URL đã đổi scheme, tránh vòng lặp đổi qua đổi lại vô hạn. */
@@ -212,6 +239,13 @@ class MainActivity : AppCompatActivity() {
                 super.onPageStarted(view, url, favicon)
                 // Ghi nhớ trang thật đang mở để "MỞ SẢNH" quay lại đúng site của người dùng.
                 url?.let { prefs.lastUrl = it }
+                updateNavState()
+            }
+
+            override fun onPageFinished(view: WebView, url: String?) {
+                super.onPageFinished(view, url)
+                // Lịch sử chỉ đổi sau khi trang xong → cập nhật nút lùi/tiến ở đây.
+                updateNavState()
             }
 
             override fun onReceivedError(
@@ -288,8 +322,9 @@ class MainActivity : AppCompatActivity() {
      */
     private fun askSiteUrl() {
         val input = android.widget.EditText(this).apply {
-            setText(prefs.siteUrl)
-            hint = "https://ten-mien-cua-ban.com"
+            // Điền sẵn link mặc định để người dùng chỉ cần bấm MỞ nếu đúng site.
+            setText(prefs.siteUrl.ifBlank { prefs.resumeUrl() })
+            hint = SitePrefs.DEFAULT_SITE
             setSingleLine()
             inputType = android.text.InputType.TYPE_TEXT_VARIATION_URI
         }
@@ -363,6 +398,7 @@ class MainActivity : AppCompatActivity() {
     override fun onBackPressed() {
         if (this::webView.isInitialized && webView.canGoBack()) {
             webView.goBack()
+            updateNavState()
         } else {
             @Suppress("DEPRECATION")
             super.onBackPressed()

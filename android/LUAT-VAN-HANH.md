@@ -135,11 +135,31 @@ App sẽ cảnh báo nếu vốn nhỏ hơn tổng thang (không đủ chạy h�
 
 ## 10. Đổi site / sửa lỗi "trang web không khả dụng"
 
+**Link mặc định của hệ thống:** `https://onbet.com/vi/` (mở ngay lần đầu, cũng là đích của
+nút **⌂** trên thanh điều hướng).
+
 Trong panel cấu hình có **ô "Link site"** + nút **MỞ LINK**:
 
 1. Dán link site đang dùng được (hoặc tên miền trần — app tự thêm `https://`).
 2. Bấm **MỞ LINK** → app mở ngay và **lưu làm site mặc định** cho các lần sau.
 
-Khi trang không tải được, app hiện thông báo lỗi kèm hướng dẫn dán link mới vào ô này.
-Cách khác: giữ lâu nút **MỞ SẢNH** → hộp thoại nhập link. App cũng nhớ **trang cuối** đã mở
-để "MỞ SẢNH" quay lại đúng chỗ.
+Khi trang không tải được, app hiện thông báo lỗi kèm hướng dẫn. Với lỗi kết nối
+(`ERR_CONNECTION_REFUSED`), app **tự thử lại** bằng `http`/`https` còn lại trước khi báo,
+vì nhiều tên miền mirror chỉ chạy một trong hai.
+
+Cách khác: giữ lâu nút **MỞ SẢNH** → hộp thoại nhập link.
+
+## 11. Thanh điều hướng (nút back)
+
+WebView chạy **toàn màn hình** nên không có thanh địa chỉ trình duyệt. Thanh nổi dọc ở
+**mép trái** bổ sung:
+
+| Nút | Việc |
+|---|---|
+| **‹** | Lùi trang (mờ đi khi không còn lịch sử) |
+| **›** | Tiến trang |
+| **⟳** | Tải lại trang |
+| **⌂** | Về trang chủ đã lưu (`https://onbet.com/vi/`) |
+
+Giữ và **kéo** thanh điều hướng để dời tới chỗ khác; chạm ngắn vẫn là bấm nút.
+Phím **back cứng** của điện thoại cũng lùi trang web trước, hết lịch sử mới thoát app.

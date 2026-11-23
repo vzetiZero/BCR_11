@@ -258,7 +258,7 @@ class ControlPanel(context: Context) : FrameLayout(context) {
             setBackground(roundFill(FIELD, dp(8), STROKE))
             setPadding(dp(7), dp(6), dp(7), dp(6))
             setSingleLine()
-            hint = "https://ten-mien-moi.com"
+            hint = "https://onbet.com/vi/"
             setHintTextColor(MUTED)
         }
         siteRow.addView(

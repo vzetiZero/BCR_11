@@ -35,8 +35,8 @@ class SitePrefs(context: Context) {
     fun resumeUrl(): String = lastUrl.ifBlank { siteUrl.ifBlank { DEFAULT_SITE } }
 
     companion object {
-        /** Trang sảnh Live mặc định (mở ngay lần đầu nếu người dùng chưa nhập link). */
-        const val DEFAULT_SITE = "https://onbet.com/en/live"
+        /** Trang chủ mặc định của hệ thống (dùng khi người dùng chưa nhập link). */
+        const val DEFAULT_SITE = "https://onbet.com/vi/"
         private const val KEY_SITE = "site_url"
         private const val KEY_LAST = "last_url"
     }
