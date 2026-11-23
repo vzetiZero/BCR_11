@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Tiền cảnh icon: chữ V đậm, bo tròn đầu nét. Nằm gọn trong vùng an toàn 66x66
+     (21..87) của adaptive icon nên không bị cắt ở mọi kiểu mặt nạ. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Chữ V -->
+    <path
+        android:pathData="M36,35 L54,73 L72,35"
+        android:strokeColor="#FF3DDC97"
+        android:strokeWidth="12"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+
+    <!-- Gạch nhấn dưới chân V: gợi ý "nền tảng / bậc thang" -->
+    <path
+        android:pathData="M40,84 L68,84"
+        android:strokeColor="#66FFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round" />
+</vector>
