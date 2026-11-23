@@ -114,6 +114,7 @@ class MainActivity : AppCompatActivity() {
             }
             onEditSite = { askSiteUrl() }
             onOpenSiteUrl = { raw -> openSiteUrl(raw) }
+            onProbe = { runProbe() }
             onApplyConfig = { capital, hands ->
                 val (ok, note) = runner.applyConfig(capital, hands)
                 toast(note)
@@ -315,6 +316,133 @@ class MainActivity : AppCompatActivity() {
         panel.setSiteUrl(url)
         webView.loadUrl(url)
         toast("Đang mở: $url")
+    }
+
+    /**
+     * Chẩn đoán DOM bàn trên thread nền rồi lưu ra file + mở hộp chia sẻ.
+     *
+     * Mục đích: bàn Evolution trên PC và trên điện thoại dùng chung link nhưng render
+     * khác nhau, nên cần đọc cấu trúc THẬT của máy đang chạy để sửa selector.
+     */
+    private fun runProbe() {
+        toast("Đang đọc cấu trúc bàn…")
+        Thread {
+            val replies = try {
+                bridge.call("probe", org.json.JSONObject(), timeoutMs = 6000, quietMs = 500)
+            } catch (t: Throwable) {
+                emptyList()
+            }
+            // Chọn khung đọc được nhiều dữ liệu nhất (khung bàn thật, không phải khung rỗng).
+            val best = replies
+                .filter { it.ok && it.result != null }
+                .maxByOrNull { r ->
+                    val obj = r.result ?: return@maxByOrNull 0
+                    (obj.optJSONArray("chips")?.length() ?: 0) +
+                        (obj.optJSONArray("spots")?.length() ?: 0) * 10 +
+                        (if (obj.optJSONObject("diag")?.optBoolean("tray") == true) 8 else 0)
+                }
+
+            val text = buildString {
+                appendLine("BCR — CHẨN ĐOÁN DOM BÀN")
+                appendLine("Lúc: ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())}")
+                appendLine("Thiết bị: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · Android ${android.os.Build.VERSION.RELEASE}")
+                appendLine("WebView khung: ${replies.size} trả lời")
+                appendLine()
+                if (best == null) {
+                    appendLine("KHÔNG có khung nào trả lời.")
+                    appendLine("→ Chưa đăng nhập, chưa vào bàn, hoặc script chưa tiêm được.")
+                } else {
+                    appendLine("=== URL khung ===")
+                    appendLine("url: ${best.url}")
+                    appendLine("result_url: ${best.result?.optString("url")}")
+                    appendLine()
+                    appendLine("=== DIAG (cách đọc hiện tại) ===")
+                    appendLine(best.result?.optJSONObject("diag")?.toString(2) ?: "null")
+                    appendLine()
+                    appendLine("=== DATA-ROLE có trên trang ===")
+                    val roles = best.result?.optJSONArray("roles")
+                    if (roles == null || roles.length() == 0) {
+                        appendLine("(không có data-role nào)")
+                    } else {
+                        for (i in 0 until roles.length()) {
+                            val o = roles.optJSONObject(i) ?: continue
+                            appendLine("  ${o.optString("role")} × ${o.optInt("count")}")
+                        }
+                    }
+                    appendLine()
+                    appendLine("=== CHIP (data-value) ===")
+                    val chips = best.result?.optJSONArray("chips")
+                    if (chips == null || chips.length() == 0) {
+                        appendLine("(không thấy chip nào)")
+                    } else {
+                        for (i in 0 until chips.length()) {
+                            val o = chips.optJSONObject(i) ?: continue
+                            appendLine(
+                                "  value=${o.optString("value")} role=${o.optString("role")} " +
+                                    "tray=${o.optBoolean("inTray")} ${o.optInt("w")}x${o.optInt("h")} " +
+                                    "tại (${o.optInt("x")},${o.optInt("y")}) text='${o.optString("text")}'"
+                            )
+                        }
+                    }
+                    appendLine()
+                    appendLine("=== Ô CƯỢC (bet-spot-*) ===")
+                    val spots = best.result?.optJSONArray("spots")
+                    if (spots == null || spots.length() == 0) {
+                        appendLine("(không thấy ô cược bet-spot-*)")
+                    } else {
+                        for (i in 0 until spots.length()) {
+                            val o = spots.optJSONObject(i) ?: continue
+                            appendLine(
+                                "  ${o.optString("role")} ${o.optInt("w")}x${o.optInt("h")} " +
+                                    "tại (${o.optInt("x")},${o.optInt("y")}) text='${o.optString("text")}'"
+                            )
+                        }
+                    }
+                    appendLine()
+                    appendLine("=== NÚT ĐẶC BIỆT (×2 / gấp đôi / hoàn tác) ===")
+                    val buttons = best.result?.optJSONArray("buttons")
+                    if (buttons == null || buttons.length() == 0) {
+                        appendLine("(không thấy)")
+                    } else {
+                        for (i in 0 until buttons.length()) {
+                            val o = buttons.optJSONObject(i) ?: continue
+                            appendLine(
+                                "  '${o.optString("text")}' role=${o.optString("role")} " +
+                                    "${o.optInt("w")}x${o.optInt("h")} tại (${o.optInt("x")},${o.optInt("y")})"
+                            )
+                        }
+                    }
+                    appendLine()
+                    appendLine("=== HTML KHAY CHIP ===")
+                    appendLine(best.result?.optString("tray_html").orEmpty().ifBlank { "(rỗng)" })
+                    appendLine()
+                    appendLine("=== HTML Ô CƯỢC ===")
+                    val html = best.result?.optJSONObject("spot_html")
+                    if (html != null) {
+                        for (key in listOf("B", "P", "T")) {
+                            appendLine("--- $key ---")
+                            appendLine(html.optString(key).ifBlank { "(không có)" })
+                        }
+                    }
+                }
+            }
+
+            // Lưu ra bộ nhớ ngoài riêng của app rồi chia sẻ.
+            val file = java.io.File(getExternalFilesDir(null), "bcr_dom_probe.txt")
+            runCatching { file.writeText(text, Charsets.UTF_8) }
+
+            runOnUiThread {
+                toast(if (best == null) "Không đọc được bàn. Đã lưu chẩn đoán." else "Đã lưu chẩn đoán DOM.")
+                val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(android.content.Intent.EXTRA_SUBJECT, "BCR DOM probe")
+                    putExtra(android.content.Intent.EXTRA_TEXT, text)
+                }
+                runCatching {
+                    startActivity(android.content.Intent.createChooser(intent, "Gửi chẩn đoán DOM"))
+                }
+            }
+        }.start()
     }
 
     /** Hỏi link site khi chưa cấu hình (hoặc khi người dùng muốn đổi site).

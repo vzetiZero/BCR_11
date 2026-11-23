@@ -42,12 +42,18 @@ class Runner(
     @Volatile var frames: Int = 0
     @Volatile var readNote: String = ""
     @Volatile var busy: Boolean = false
+    /** Số ván đã nhận được từ WebSocket của bàn (0 = bàn không dùng WS / chưa bắt được). */
+    @Volatile var wsRounds: Int = 0
     @Volatile private var lastError: String = ""
 
     private var stableLetters: String = ""
     private var stableCount = 0
+    /** Mốc thời gian ván WebSocket đã xử lý — chặn đếm trùng một ván. */
+    private var lastWsSeq: Long = 0
+    /** Chặn hai luồng cùng bấm chip cho một kế hoạch. */
+    private val planClaim = AtomicBoolean(false)
     private var entered = false
-    private val pollMs: Long = 1100
+    private val pollMs: Long = 300
 
     /** Callback do Activity cài để bấm cảm ứng thật tại toạ độ CSS px của khung gốc. */
     var onTapRequested: (Float, Float) -> Boolean = { _, _ -> false }
@@ -60,6 +66,8 @@ class Runner(
         entered = false
         stableLetters = ""
         stableCount = 0
+        wsRounds = 0
+        lastWsSeq = 0
         lastError = ""
         thread = Thread({ loop() }, "bcr-runner").apply {
             isDaemon = true
@@ -143,9 +151,9 @@ class Runner(
 
     /** Đọc bàn đang mở ở bất kỳ khung nào (CHẶN — gọi ngoài UI thread). */
     fun scanTable(): TableScan? {
-        // Khung TRÊN CÙNG cũng có table_id trong URL nên nó tự nhận "in_table" dù rỗng cầu;
-        // bàn thật nằm trong iframe. Phải chờ khung nào đọc được ÍT NHẤT 1 dãy cầu,
-        // nếu không sẽ thoát sớm với khung rỗng và tưởng là chưa vào bàn.
+        // Ưu tiên khung đọc được ÍT NHẤT 1 dãy cầu (bàn thật nằm trong iframe). Nếu hết giờ
+        // mà chưa khung nào có cầu thì vẫn nhận bàn theo `table_id` trong URL: phương pháp
+        // 1-1 không cần cầu trước đó, chỉ cần biết mình đang ở bàn nào.
         val replies = bridge.call(
             "scan", JSONObject(), timeoutMs = 3200, quietMs = 180,
             until = { reply ->
@@ -155,17 +163,41 @@ class Runner(
             }
         )
         frames = bridge.knownFrameCount()
-        val reply = bridge.tableReply(replies) ?: return null
+
+        // Trường hợp 1: có khung đọc được cầu.
+        val withRoad = bridge.tableReply(replies)
+            ?.takeIf { (it.result?.optJSONArray("tables")?.length() ?: 0) > 0 }
+        if (withRoad != null) {
+            return fromReply(withRoad)
+        }
+
+        // Trường hợp 2: đang ở trong bàn nhưng cầu chưa render → trả bàn với cầu rỗng.
+        val inTable = replies.firstOrNull {
+            it.ok && it.result?.optBoolean("in_table") == true
+        }
+        if (inTable != null) {
+            return fromReply(inTable, allowEmptyRoad = true)
+        }
+        return null
+    }
+
+    /** Dựng [TableScan] từ một trả lời quét trang. */
+    private fun fromReply(reply: Bridge.Reply, allowEmptyRoad: Boolean = false): TableScan? {
         val result = reply.result ?: return null
-        val tables = result.optJSONArray("tables") ?: return null
-        if (tables.length() == 0) return null
-        val row = tables.optJSONObject(tables.length() - 1) ?: return null
         val page = result.optJSONObject("page")
-        val tableId = row.optString("table_id").ifBlank { page?.optString("table_id") ?: "" }
-        val name = row.optString("label").ifBlank { if (tableId.isBlank()) "Bàn đang mở" else tableId }
+        val tables = result.optJSONArray("tables")
+        val count = tables?.length() ?: 0
+        if (count == 0 && !allowEmptyRoad) return null
+
+        val row = if (count > 0) tables?.optJSONObject(count - 1) else null
+        val tableId = row?.optString("table_id").orEmpty()
+            .ifBlank { page?.optString("table_id") ?: "" }
+        if (tableId.isBlank()) return null
+        val name = row?.optString("label").orEmpty()
+            .ifBlank { liveTableName.ifBlank { tableId } }
         liveWallet = page?.optString("wallet") ?: ""
-        readNote = row.optString("read_error")
-        return TableScan(tableId, name, row.optString("letters"), liveWallet)
+        readNote = row?.optString("read_error").orEmpty()
+        return TableScan(tableId, name, row?.optString("letters").orEmpty(), liveWallet)
     }
 
     /** Danh sách ô bàn đang thấy ở sảnh (CHẶN). */
@@ -259,10 +291,8 @@ class Runner(
         liveTableId = scan.tableId
         liveTableName = scan.name
         liveLetters = scan.letters
-        if (scan.letters.isBlank()) {
-            fail("Đã thấy bàn nhưng chưa đọc được cầu bàn. Chờ ván mới rồi bấm BẮT ĐẦU lại.")
-            return false
-        }
+        // Phương pháp 1-1 không xét cầu trước đó và kết quả tay lấy từ WebSocket, nên
+        // vào bàn là chốt kế hoạch Banker ngay — không chờ cầu render.
         val check = Method.checkTable(scan.letters.length, session.minHands, session.maxHands)
         if (!check.eligible) {
             fail(
@@ -276,16 +306,20 @@ class Runner(
             fail(session.note)
             return false
         }
+        // Chốt kế hoạch Banker ngay: đây là tay đầu của chuỗi B-P-B-P.
+        session.beginFirstHand()
         stableLetters = scan.letters
         stableCount = 0
         entered = true
         lastError = ""
         publish()
+        // Đặt luôn nếu còn kịp cửa sổ cược của ván hiện tại.
+        placeIfNeeded()
         return true
     }
 
     /**
-     * Chờ tới khi đọc được bàn có cầu. Tự vào bàn từ sảnh nếu đang đứng ở sảnh.
+     * Chờ tới khi đọc được bàn đang mở. Tự vào bàn từ sảnh nếu đang đứng ở sảnh.
      * Trả null khi hết thời gian chờ.
      */
     private fun waitForTable(): TableScan? {
@@ -294,15 +328,12 @@ class Runner(
         var waited = 0
         while (running.get() && System.currentTimeMillis() < deadline) {
             val scan = scanTable()
-            if (scan != null && scan.letters.isNotBlank()) return scan
             if (scan != null) {
-                // Thấy bàn nhưng chưa có cầu (ván chưa bắt đầu) — chờ tiếp.
-                lastError = "Đã thấy bàn ${scan.name}, đang chờ cầu hiện ra…"
-                liveInTable = true
-                liveTableName = scan.name
-                publish()
+                // Có bàn là đủ để bắt đầu: phương pháp 1-1 không xét cầu trước đó, và
+                // kết quả tay lấy từ WebSocket nên cũng không cần chờ cầu render.
+                return scan
             } else if (inTableByUrl()) {
-                lastError = "Bàn đang tải, đang chờ cầu…"
+                lastError = "Bàn đang tải…"
                 publish()
             } else if (!triedAutoEnter) {
                 // Đang ở sảnh → tự vào một bàn chuẩn một lần, rồi chờ bàn tải.
@@ -372,6 +403,19 @@ class Runner(
     }
 
     private fun tick() {
+        // Ưu tiên WebSocket: có kết quả ván là cân tay ngay, không chờ cầu render và
+        // không lệch khi cầu loạn. Cầu chỉ còn là đường dự phòng khi bàn không có WS.
+        if (tickRound()) return
+
+        // Đã biết bàn rồi thì KHÔNG quét lại toàn trang mỗi nhịp: mỗi lần quét tốn tới
+        // 3,2 giây nên vòng lặp bị trễ và bỏ lỡ cửa sổ đặt cược của ván kế tiếp. Cầu
+        // cũng không cần nữa vì kết quả lấy từ WebSocket.
+        if (liveInTable && liveTableId.isNotBlank()) {
+            // Chỉ đặt khi đang có kế hoạch chờ và bàn đã sạch chip.
+            if (session.pendingPlan() != null) placeIfNeeded()
+            return
+        }
+
         val scan = scanTable()
         if (scan == null) {
             liveInTable = false
@@ -405,13 +449,52 @@ class Runner(
         }
     }
 
+    /**
+     * Đọc kết quả ván trực tiếp từ WebSocket của bàn và cân tay vừa đặt.
+     *
+     * Đây là đường CHÍNH khi bàn có WebSocket: server báo cửa thắng ngay khi ván kết
+     * thúc nên không phải chờ cầu render, không lệch khi cầu loạn. Trả true khi đã
+     * xử lý một ván mới (để vòng lặp bỏ qua đường đọc cầu trong nhịp đó).
+     */
+    private fun tickRound(): Boolean {
+        val replies = bridge.call(
+            "round", JSONObject(), timeoutMs = 350, quietMs = 60,
+            until = { it.ok && it.result?.optJSONObject("round") != null }
+        )
+        // Chọn khung báo ván MỚI NHẤT (khung bàn thật có WebSocket của Evolution).
+        val best = replies.asSequence()
+            .mapNotNull { r -> r.result?.optJSONObject("round")?.let { r to it } }
+            .filter { it.second.optString("winner").isNotBlank() }
+            .maxByOrNull { it.second.optLong("at", 0L) }
+            ?: return false
+
+        val round = best.second
+        val winner = round.optString("winner").uppercase().take(1)
+        if (winner != "B" && winner != "P" && winner != "T") return false
+        val seq = round.optLong("at", 0L)
+        if (seq <= lastWsSeq) return false
+        lastWsSeq = seq
+        wsRounds += 1
+
+        val step = session.applyRound(winner, seq)
+        when (step) {
+            Step.ARMED -> placeIfNeeded()
+            Step.PAUSED -> running.set(false)
+            Step.IDLE -> Unit
+        }
+        return step != Step.IDLE
+    }
+
     // ------------------------------------------------------------------ đặt chip
 
     private fun placeIfNeeded() {
         val plan = session.pendingPlan() ?: return
         if (plan.placed != Placement.PENDING) return
+        // Chỉ đặt MỘT lần cho mỗi kế hoạch, và không chen giữa lúc đang bấm.
+        if (!planClaim.compareAndSet(false, true)) return
         if (!autoPlace) {
             session.markPlaced(false, "Đang tắt tự đặt chip.", plan)
+            planClaim.set(false)
             return
         }
         busy = true
@@ -419,6 +502,7 @@ class Runner(
             if (!placeReal(plan)) retryWithTouch(plan)
         } finally {
             busy = false
+            planClaim.set(false)
         }
     }
 

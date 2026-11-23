@@ -12,8 +12,8 @@ android {
         applicationId = "com.bcr.android"
         minSdk = 26
         targetSdk = 37
-        versionCode = 5
-        versionName = "1.5"
+        versionCode = 8
+        versionName = "1.8"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

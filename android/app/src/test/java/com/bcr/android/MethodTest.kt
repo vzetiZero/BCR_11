@@ -231,18 +231,27 @@ class SessionTest {
     }
 
     @Test
-    fun `a hand without a placed chip is skipped and never touches money`() {
+    fun `a hand without a placed chip keeps the same side and stake without touching money`() {
         val s = session()
         val balance = s.money.balance
         s.start()
         s.process(s.letters + "P")
         val plan = s.pendingPlan()!!
+        val side = plan.side
+        val stake = plan.stake
         s.markPlaced(false, "khay chip trống", plan)
-        s.process(s.letters + "B")
+        val step = s.process(s.letters + "B")
+        // Trượt chip: vốn không đổi, chưa tính tay nào, nhưng vẫn sẵn sàng đánh lại
+        // ĐÚNG cửa + ĐÚNG bậc đó ở ván kế tiếp để chuỗi không bị đứt.
         assertEquals(balance, s.money.balance, 0.001)
         assertEquals(0, s.money.handsPlayed)
         assertEquals(1, s.placeSkips)
         assertEquals("not_placed", s.log.last().outcome)
+        assertEquals(com.bcr.android.model.Step.ARMED, step)
+        assertTrue(s.running)
+        val next = s.pendingPlan()!!
+        assertEquals(side, next.side)
+        assertEquals(stake, next.stake, 0.001)
     }
 
     @Test
@@ -260,18 +269,25 @@ class SessionTest {
             s.process(letters)
         }
         assertFalse(s.running)
-        assertTrue(s.note.contains("bỏ"))
+        assertTrue(s.note.contains("trượt"))
+        assertEquals(0, s.money.handsPlayed)
     }
 
     @Test
-    fun `road jump after entry pauses instead of settling back-dated hands`() {
+    fun `road jump before the chip is confirmed still waits then settles one hand`() {
         val s = session("B".repeat(12))
         s.start()
-        s.process(s.letters + "P")            // tay mở màn: chỉ đồng bộ cầu
-        val step = s.process(s.letters + "PB") // nhảy 2 tay khi đã có kế hoạch
-        assertEquals(com.bcr.android.model.Step.PAUSED, step)
-        assertFalse(s.running)
+        s.process(s.letters + "P")            // tay mở màn: đồng bộ cầu + chốt kế hoạch
+        val plan = s.pendingPlan()!!
+        // Chưa xác nhận chip → chưa được tính tay nào, kể cả khi cầu đã nhảy.
+        assertEquals(com.bcr.android.model.Step.IDLE, s.process(s.letters + "PB"))
         assertEquals(0, s.money.handsPlayed)
+        assertTrue(s.running)
+        // Xác nhận chip xong thì tính đúng MỘT tay: ký tự ĐẦU của phần cầu mới.
+        s.markPlaced(true, "ok", plan)
+        s.process(s.letters + "PB")
+        assertEquals(1, s.money.handsPlayed)
+        assertTrue(s.running)
     }
 
     @Test
@@ -285,15 +301,17 @@ class SessionTest {
     }
 
     @Test
-    fun `later hands never settle two results at once`() {
+    fun `later hands settle the first new result and absorb the rest`() {
         val s = session("B".repeat(12))
         s.start()
         s.process(s.letters + "P")
         val plan = s.pendingPlan()!!
         s.markPlaced(true, "ok", plan)
-        val step = s.process(s.letters + "PBP")   // nhảy 3 tay sau khi đã đặt
-        assertEquals(com.bcr.android.model.Step.PAUSED, step)
-        assertEquals(0, s.money.handsPlayed)
+        // Cầu nhảy 3 tay: tay ĐẦU là kết quả của lượt mình vừa đặt, hai tay sau chỉ
+        // dồn vào mốc. Nhờ vậy không dừng phiên oan khi bàn chạy nhanh.
+        val before = s.money.handsPlayed
+        s.process(s.letters + "PBP")
+        assertEquals(before + 1, s.money.handsPlayed)
     }
 
     @Test

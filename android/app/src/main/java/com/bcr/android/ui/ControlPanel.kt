@@ -42,6 +42,9 @@ class ControlPanel(context: Context) : FrameLayout(context) {
     /** Mở link do người dùng dán vào ô "Link site" trong panel. */
     var onOpenSiteUrl: (String) -> Unit = {}
 
+    /** Chẩn đoán DOM bàn (dùng khi cần map lại selector theo layout mobile). */
+    var onProbe: () -> Unit = {}
+
     private val capitalInput = android.widget.EditText(context)
     private val handsInput = android.widget.EditText(context)
     private val siteInput = android.widget.EditText(context)
@@ -162,14 +165,24 @@ class ControlPanel(context: Context) : FrameLayout(context) {
         startButton = pill("BẮT ĐẦU", ACCENT)
         stopButton = pill("DỪNG", STOP)
         val readButton = pill("ĐỌC BÀN", SLATE)
+        val probeButton = pill("CHẨN ĐOÁN", SLATE)
         startButton.setOnClickListener { onStart() }
         stopButton.setOnClickListener { onStop() }
         readButton.setOnClickListener { onRead() }
+        probeButton.setOnClickListener { onProbe() }
         row1.addView(startButton, weight())
         row1.addView(space())
         row1.addView(stopButton, weight())
         row1.addView(space())
         row1.addView(readButton, weight())
+
+        // Hàng riêng cho chẩn đoán: chỉ dùng khi cần đọc cấu trúc bàn để sửa selector.
+        val row1b = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(6), 0, 0)
+        }
+        row1b.addView(probeButton, weight())
+        card.addView(row1b)
         card.addView(row1)
 
         val row2 = LinearLayout(context).apply {

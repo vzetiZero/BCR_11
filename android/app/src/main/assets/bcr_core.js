@@ -29,6 +29,121 @@
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
+  /* ============================ thu khung WebSocket ============================
+   *
+   * Bàn Baccarat của nhà cái báo kết quả ván qua WebSocket. Đọc khung đó chính xác
+   * hơn hẳn đọc cầu bằng DOM: không phụ thuộc selector, không lệch khi cầu loạn,
+   * không nhầm khi đổi shoe. Ở đây CHỈ ĐỌC — không gửi gì lên server, không sửa
+   * khung, nên không can thiệp vào phiên chơi của người dùng.
+   *
+   * `WebSocket` được thay bằng lớp bọc giữ nguyên toàn bộ hành vi gốc: mọi thứ trang
+   * gửi/nhận vẫn đi đúng đường. Bộ thu chỉ ghi lại ván đã kết thúc để native hỏi.
+   */
+
+  // Ván gần nhất server báo đã có kết quả: { at, table, winner, shoe, round }.
+  var lastRound = null;
+  // Đếm số khung đã đọc, để native biết bộ thu có thật sự bắt được gì không.
+  var wsSeen = 0;
+  var WS_MAX_KEEP = 40;
+
+  /** Chuẩn hoá tên cửa thắng về B/P/T. */
+  function normWinner(raw) {
+    if (raw === null || raw === undefined) return '';
+    var s = String(raw).trim().toUpperCase();
+    if (!s) return '';
+    // Evolution dùng "Banker"/"Player"/"Tie" hoặc 1/2/3 hoặc "B"/"P"/"T".
+    if (s === 'B' || s === 'BANKER' || s === '1') return 'B';
+    if (s === 'P' || s === 'PLAYER' || s === '2') return 'P';
+    if (s === 'T' || s === 'TIE' || s === '3') return 'T';
+    return '';
+  }
+
+  /** Lấy giá trị đầu tiên khớp trong danh sách khoá (không phân biệt hoa thường). */
+  function pick(obj, keys) {
+    if (!obj || typeof obj !== 'object') return undefined;
+    var lowerMap = {};
+    for (var k in obj) {
+      if (Object.prototype.hasOwnProperty.call(obj, k)) lowerMap[String(k).toLowerCase()] = obj[k];
+    }
+    for (var i = 0; i < keys.length; i++) {
+      var v = lowerMap[String(keys[i]).toLowerCase()];
+      if (v !== undefined && v !== null) return v;
+    }
+    return undefined;
+  }
+
+  /** Dò một object bất kỳ tìm thông tin "ván đã kết thúc". */
+  function readRoundFrom(obj, depth) {
+    if (!obj || typeof obj !== 'object' || depth > 6) return null;
+    var winner = normWinner(pick(obj, [
+      'winner', 'winningoutcome', 'result', 'outcome', 'winningside',
+      'winnercode', 'resultcode'
+    ]));
+    if (winner) {
+      return {
+        winner: winner,
+        table: String(pick(obj, ['tableid', 'table_id', 'tableidcode']) || ''),
+        shoe: String(pick(obj, ['shoeid', 'shoe_id', 'shoe']) || ''),
+        round: String(pick(obj, ['roundid', 'round_id', 'gameid', 'round']) || '')
+      };
+    }
+    // Đi sâu vào object lồng nhau (payload bọc nhiều lớp).
+    for (var k in obj) {
+      if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+      var v = obj[k];
+      if (v && typeof v === 'object') {
+        var found = readRoundFrom(v, depth + 1);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  /** Ghi một khung nhận được: chỉ giữ lại nếu nó báo kết quả ván. */
+  function tapFrame(data) {
+    if (typeof data !== 'string' || data.length < 12 || data.length > 200000) return;
+    // Lọc nhanh trước khi JSON.parse: phần lớn khung không liên quan.
+    if (!/result|winner|outcome/i.test(data)) return;
+    wsSeen += 1;
+    var parsed;
+    try { parsed = JSON.parse(data); } catch (e) { return; }
+    var round = readRoundFrom(parsed, 0);
+    if (!round) return;
+    // Bỏ qua nếu trùng đúng ván vừa ghi (server hay gửi lặp).
+    if (lastRound && round.round && lastRound.round === round.round &&
+        lastRound.winner === round.winner) return;
+    round.at = Date.now();
+    round.seq = (lastRound ? lastRound.seq + 1 : 1);
+    lastRound = round;
+  }
+
+  // Tách nhiều khung nối bằng ký tự xuống dòng (một số sòng gộp batch).
+  function tapFrames(raw) {
+    if (typeof raw !== 'string') return;
+    if (raw.indexOf('\n') === -1) { tapFrame(raw); return; }
+    raw.split('\n').forEach(function (line) { if (line) tapFrame(line); });
+  }
+
+  (function installWsTap() {
+    var Native = window.WebSocket;
+    if (!Native || Native.__bcrTapped) return;
+    function BcrWebSocket(url, protocols) {
+      var ws = protocols === undefined ? new Native(url) : new Native(url, protocols);
+      try {
+        ws.addEventListener('message', function (ev) { tapFrames(ev.data); });
+      } catch (e) { /* bỏ qua: chỉ là tính năng phụ trợ */ }
+      return ws;
+    }
+    // Giữ nguyên prototype/static để mọi thư viện dùng `instanceof` vẫn đúng.
+    BcrWebSocket.prototype = Native.prototype;
+    BcrWebSocket.CONNECTING = Native.CONNECTING;
+    BcrWebSocket.OPEN = Native.OPEN;
+    BcrWebSocket.CLOSING = Native.CLOSING;
+    BcrWebSocket.CLOSED = Native.CLOSED;
+    BcrWebSocket.__bcrTapped = true;
+    try { window.WebSocket = BcrWebSocket; } catch (e) { /* bỏ qua */ }
+  })();
+
   /* ============================== cầu nối native ============================== */
 
   function post(payload) {
@@ -459,22 +574,27 @@
     document.querySelectorAll('[data-role="Bead-road"]').forEach(function (bead) {
       var items = bead.querySelectorAll('[data-role="roadItem"][name]');
       if (!items.length) return;
-      var letters = '', readError = '';
+      var letters = '', readError = '', skipped = 0;
       for (var i = 0; i < items.length; i++) {
+        // Ô cầu có thể ghi "Banker Player" (ván có cả hai) — lấy ký tự ĐẦU làm cửa quyết định.
         var raw = (items[i].getAttribute('name') || '').trim().split(/\s+/)[0];
         var side = names[raw];
         if (!side) {
-          letters = '';
-          readError = 'Cầu bàn có ký hiệu lạ; không suy đoán kết quả.';
-          break;
+          // Không xoá cả cầu vì một ô lạ: bỏ qua ô đó và ghi lại số ô đã bỏ. Xoá sạch
+          // khiến app không đọc được cầu nào dù bàn hoàn toàn bình thường.
+          skipped += 1;
+          continue;
         }
         letters += side;
         if (letters.length > 400) {
-          letters = '';
-          readError = 'Lịch sử vượt giới hạn 400 tay.';
-          break;
+          letters = letters.slice(-400);
+          readError = 'Cầu dài quá 400 tay, chỉ giữ 400 tay gần nhất.';
         }
       }
+      if (skipped > 0 && !readError) {
+        readError = 'Bỏ qua ' + skipped + ' ô cầu có ký hiệu lạ.';
+      }
+      if (!letters.length) return;
       var r = bead.getBoundingClientRect();
       roads.push({
         letters: letters, label: '', read_error: readError, source: 'evo-bead',
@@ -773,12 +893,14 @@
         if (chips[v] && chips[v].area >= area) continue;
         var p = pointOf(el);
         if (!p) continue;
-        chips[v] = { x: p.x, y: p.y, abs: p.abs, area: area };
+        // Giữ THAM CHIẾU element: trên mobile các chip xếp chồng nhau nên nếu chỉ
+        // dùng toạ độ rồi elementFromPoint sẽ bấm nhầm sang chip nằm trên.
+        chips[v] = { el: el, x: p.x, y: p.y, abs: p.abs, area: area };
       }
     }
     var sp = pointOf(spot);
     if (!sp) return null;
-    return { spot: sp, chips: chips };
+    return { spot: { el: spot, x: sp.x, y: sp.y, abs: sp.abs }, chips: chips };
   }
 
   function fire(el, type, x, y) {
@@ -799,18 +921,34 @@
     el.dispatchEvent(ev);
   }
 
-  function synthTap(point) {
-    if (!point) return false;
-    var el = document.elementFromPoint(point.x, point.y);
+  /* Bấm vào ĐÚNG element được chỉ định (không tra lại theo toạ độ).
+   * Trên desktop mỗi chip là một ô riêng nên tra toạ độ vẫn đúng; trên điện thoại các chip
+   * trong khay xếp chồng lên nhau nên elementFromPoint sẽ trả về chip NẰM TRÊN, khiến app
+   * bấm sai mệnh giá. Truyền thẳng element lấy từ DOM là cách duy nhất chắc chắn đúng. */
+  function synthTap(target) {
+    if (!target) return false;
+    var el = null, x = 0, y = 0;
+    if (target.el) {
+      el = target.el;
+      x = target.x || 0;
+      y = target.y || 0;
+    } else {
+      // Tương thích chỗ gọi cũ chỉ truyền toạ độ.
+      x = target.x || 0;
+      y = target.y || 0;
+      el = document.elementFromPoint(x, y);
+    }
     if (!el) return false;
-    fire(el, 'pointerover', point.x, point.y);
-    fire(el, 'pointerenter', point.x, point.y);
-    fire(el, 'mouseover', point.x, point.y);
-    fire(el, 'pointerdown', point.x, point.y);
-    fire(el, 'mousedown', point.x, point.y);
-    fire(el, 'pointerup', point.x, point.y);
-    fire(el, 'mouseup', point.x, point.y);
-    fire(el, 'click', point.x, point.y);
+    // Element có thể đã bị React thay khỏi DOM giữa lúc đo và lúc bấm.
+    if (!document.contains(el)) return false;
+    fire(el, 'pointerover', x, y);
+    fire(el, 'pointerenter', x, y);
+    fire(el, 'mouseover', x, y);
+    fire(el, 'pointerdown', x, y);
+    fire(el, 'mousedown', x, y);
+    fire(el, 'pointerup', x, y);
+    fire(el, 'mouseup', x, y);
+    fire(el, 'click', x, y);
     return true;
   }
 
@@ -846,6 +984,12 @@
       remaining -= count * d;
       for (var k = 0; k < count; k++) picked.push(d);
     });
+    // Số tiền nhỏ hơn mệnh giá nhỏ nhất (hoặc lẻ không chia hết) thì đặt ĐÚNG MỘT chip
+    // nhỏ nhất — làm tròn LÊN, không bỏ tay. Thà cược hơi cao hơn bậc mong muốn còn hơn
+    // dừng cả phiên chỉ vì người dùng nhập bậc 1 thấp hơn min bet của bàn.
+    if (!picked.length && denoms.length) {
+      return { exact: false, chips: [denoms[0]], roundedUp: true, wanted: target };
+    }
     return { exact: false, chips: picked };
   }
 
@@ -900,12 +1044,14 @@
     var denoms = (first.denominations && first.denominations.length)
       ? first.denominations : [20, 50, 250, 1000, 5000, 10000];
     var split = decompose(want, denoms);
-    if (!split.exact || !split.chips.length) {
+    if (!split.chips.length) {
       return {
         ok: false, reason: 'ungroupable',
         note: want + ' không ghép được bằng mệnh giá ' + denoms.join('/') + '.'
       };
     }
+    // Số tiền THẬT sẽ đặt sau khi ghép/làm tròn chip — dùng để đối chiếu với bàn.
+    var actual = split.chips.reduce(function (s, v) { return s + v; }, 0);
 
     var targets = null;
     while (Date.now() < waitUntil && !targets) {
@@ -953,6 +1099,7 @@
     if (args.dryRun) {
       return {
         ok: true, dry_run: true, note: 'Chỉ tính toạ độ.',
+        want: want, actual: actual, rounded: !!split.roundedUp,
         steps: steps, chips: split.chips, denominations: denoms
       };
     }
@@ -961,22 +1108,28 @@
     var got = spotAmount(side);
     while (Date.now() < verifyUntil) {
       got = spotAmount(side);
-      if (got !== null && startAmount !== null && got - startAmount === want) break;
+      if (got !== null && startAmount !== null && got - startAmount === actual) break;
       await sleep(120);
     }
     var delta = (got === null || startAmount === null) ? null : got - startAmount;
-    if (delta === want) {
+    if (delta === actual) {
+      var note = 'Đã đặt ' + actual + ' vào ' + role + '.';
+      if (actual !== want) {
+        note += ' (bậc muốn đặt ' + want + ' thấp hơn mệnh giá nhỏ nhất nên đặt ' +
+          actual + '.)';
+      }
       return {
-        ok: true, note: 'Đã đặt ' + want + ' vào ' + role + '.',
+        ok: true, note: note, want: want, actual: actual, rounded: !!split.roundedUp,
         placed: placedChips, spot_after: got, steps: steps
       };
     }
     return {
       ok: false, reason: 'verify_failed',
       needs_real_touch: true,
-      missing: (delta === null ? want : Math.max(0, want - delta)),
+      missing: (delta === null ? actual : Math.max(0, actual - delta)),
       note: 'Sau khi bấm, ô ' + role + ' còn ' + (got === null ? '?' : got)
-        + ' (cần +' + want + ').',
+        + ' (cần +' + actual + ').',
+      want: want, actual: actual,
       placed: placedChips, spot_after: got, steps: steps
     };
   }
@@ -1001,11 +1154,104 @@
     var p = pointOf(tile, { fx: 0.42, fy: 0.62 });
     if (!p) return { ok: false, reason: 'tile_hidden', note: 'Không đo được ô bàn.' };
     var clicked = false;
-    if (!args.dryRun) clicked = synthTap(p);
+    if (!args.dryRun) clicked = synthTap({ el: tile, x: p.x, y: p.y });
     return {
       ok: true, x: p.x, y: p.y, abs: p.abs, clicked: clicked,
       title: tableTileOf(tile) ? (tableTileOf(tile).title || id) : id
     };
+  }
+
+  /* ============================== chẩn đoán DOM bàn ============================== */
+
+  /**
+   * Dump cấu trúc bàn đang mở để map selector đúng với layout MOBILE.
+   *
+   * Bàn Evolution trên PC và trên điện thoại dùng chung link nhưng render khác nhau:
+   * khay chip có thể xếp chồng, ô cược đổi data-role. Hàm này trả về mọi thứ cần biết
+   * để sửa selector: các element có data-role, khay chip, ô cược, nút ×2/gấp đôi.
+   */
+  function probeTable() {
+    var out = { url: location.href, roles: [], chips: [], spots: [], buttons: [], diag: {} };
+
+    // 1) Mọi data-role đang có trên trang, kèm số lượng.
+    var roleCount = {};
+    document.querySelectorAll('[data-role]').forEach(function (el) {
+      var role = el.getAttribute('data-role');
+      if (!role) return;
+      roleCount[role] = (roleCount[role] || 0) + 1;
+    });
+    out.roles = Object.keys(roleCount).sort().map(function (r) {
+      return { role: r, count: roleCount[r] };
+    });
+
+    // 2) Mọi element mang data-value (chip) — kèm vị trí + kích thước để biết cái nào thật.
+    document.querySelectorAll('[data-value]').forEach(function (el) {
+      var v = parseInt(el.getAttribute('data-value'), 10);
+      var r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return;
+      out.chips.push({
+        value: isFinite(v) ? v : el.getAttribute('data-value'),
+        role: el.getAttribute('data-role') || '',
+        x: Math.round(r.x), y: Math.round(r.y),
+        w: Math.round(r.width), h: Math.round(r.height),
+        text: txt(el).slice(0, 24),
+        cls: String(el.className || '').slice(0, 60),
+        inTray: !!el.closest('[data-role="chip-stack"]')
+      });
+    });
+
+    // 3) Ô cược: tìm theo data-role bet-spot-* và cả các ô lớn ở khu cược.
+    document.querySelectorAll('[data-role^="bet-spot-"]').forEach(function (el) {
+      var r = el.getBoundingClientRect();
+      out.spots.push({
+        role: el.getAttribute('data-role'),
+        x: Math.round(r.x), y: Math.round(r.y),
+        w: Math.round(r.width), h: Math.round(r.height),
+        text: txt(el).slice(0, 40)
+      });
+    });
+
+    // 4) Nút bấm đáng chú ý: ×2, gấp đôi, hoàn tác, xoá.
+    var PAT = /(x\s*2|×\s*2|double|gấp đôi|gap doi|hoàn tác|hoan tac|undo|xóa|clear)/i;
+    document.querySelectorAll('button,[role="button"],[data-role]').forEach(function (el) {
+      var label = (txt(el) || el.getAttribute('aria-label') || '').trim();
+      if (!label || label.length > 40) return;
+      if (!PAT.test(label) && !PAT.test(el.getAttribute('data-role') || '')) return;
+      var r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return;
+      out.buttons.push({
+        text: label.slice(0, 30),
+        role: el.getAttribute('data-role') || '',
+        cls: String(el.className || '').slice(0, 60),
+        x: Math.round(r.x), y: Math.round(r.y),
+        w: Math.round(r.width), h: Math.round(r.height)
+      });
+    });
+
+    // 5) Chẩn đoán cách đọc hiện tại thấy gì.
+    out.diag = {
+      bead_roads: document.querySelectorAll('[data-role="Bead-road"]').length,
+      road_items: document.querySelectorAll('[data-role="roadItem"][name]').length,
+      tray: !!trayOf(),
+      spots_found: ['B', 'P', 'T'].filter(function (s) { return !!spotOf(s); }).length,
+      read_chips: (function () {
+        try {
+          var c = readChips();
+          return { has_table: c.has_table, total: c.total, denoms: c.denominations };
+        } catch (e) { return { error: String(e) }; }
+      })()
+    };
+
+    // 6) Mẫu HTML của khay chip và mỗi ô cược (để biết cấu trúc thật).
+    var tray = trayOf();
+    out.tray_html = tray ? String(tray.outerHTML || '').slice(0, 1200) : '';
+    out.spot_html = {};
+    ['B', 'P', 'T'].forEach(function (s) {
+      var el = spotOf(s);
+      out.spot_html[s] = el ? String(el.outerHTML || '').slice(0, 700) : '';
+    });
+
+    return out;
   }
 
   /* ================================ điều phối lệnh ================================ */
@@ -1026,6 +1272,19 @@
         return { ok: true, url: location.href, has_table_id: /[#?&]table_id=/.test(location.href) };
       case 'chips':
         return readChips();
+      case 'round':
+        // Kết quả ván gần nhất bắt được từ WebSocket của bàn.
+        // Native dùng số thứ tự `seq` để biết đã xử lý ván nào rồi.
+        return {
+          ok: true, round: lastRound, seq: lastRound ? lastRound.seq : 0,
+          ws_frames: wsSeen, tapped: !!window.WebSocket.__bcrTapped
+        };
+      case 'round_reset':
+        lastRound = null;
+        wsSeen = 0;
+        return { ok: true };
+      case 'probe':
+        return probeTable();
       case 'place':
         return placeBet(args);
       case 'open_tile':
