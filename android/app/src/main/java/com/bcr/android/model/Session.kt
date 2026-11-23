@@ -43,9 +43,6 @@ class Session(
     var method: MethodState = MethodState(); private set
     val log: MutableList<HandRecord> = mutableListOf()
 
-    /** Số thứ tự ván WebSocket đã xử lý — chặn tính trùng một ván hai lần. */
-    private var lastRoundSeq: Long = 0
-
     // ------------------------------------------------------------------ cấu hình
 
     fun configure(
@@ -96,8 +93,8 @@ class Session(
     }
 
     /**
-     * Bắt đầu theo dõi sau khi xác nhận bàn hợp lệ: chờ kết quả tay đang chạy rồi mới
-     * chốt kế hoạch đầu tiên (không bấm vào cửa sổ cược đã đóng).
+     * Bắt đầu theo dõi sau khi xác nhận bàn hợp lệ. Chốt kế hoạch đầu tiên (luôn Banker)
+     * ngay, không chờ cầu — phương pháp 1-1 không xét cầu trước đó.
      */
     fun start(): Boolean {
         val problem = money.blocked
@@ -113,7 +110,7 @@ class Session(
         running = true
         entryWaiting = true
         pending = null
-        note = "Vừa vào bàn · chờ kết quả tay hiện tại rồi mới đặt cược."
+        note = "Đã vào bàn · chuẩn bị đặt tay đầu tiên."
         return true
     }
 
@@ -169,12 +166,29 @@ class Session(
         if (entryWaiting) {
             // Phương pháp 1-1 KHÔNG xét cầu trước đó: vào bàn là chốt kế hoạch Banker
             // ngay, không chờ cầu render. Cầu chỉ dùng làm MỐC để biết tay nào là tay
-            // mình vừa đặt; kết quả thật lấy từ WebSocket (xem [applyRound]).
+            // mình vừa đặt.
             entryWaiting = false
             letters = currentLetters
             results = currentLetters.map { it.toString() }
             if (exitIfStreakTooLong(currentLetters)) return Step.PAUSED
             note = "Đã vào bàn; chốt kế hoạch tay đầu tiên."
+            return if (arm()) Step.ARMED else Step.PAUSED
+        }
+
+        // BẪY: lúc vào bàn cầu còn rỗng nên mốc là "". Nếu cả lịch sử hiện ra cùng lúc
+        // thì mọi chuỗi đều "bắt đầu bằng" mốc rỗng, và ký tự đầu tiên sẽ bị hiểu nhầm
+        // là kết quả tay mình vừa đặt. Không đoán: chỉ đồng bộ mốc, giữ nguyên cửa +
+        // bậc. Nếu đã lỡ đặt tiền thì coi như lượt đó không đọc được kết quả (xử lý y
+        // như trượt chip: giữ nguyên cửa/bậc, đánh lại ván kế) — không ghi sai sổ vốn.
+        if (letters.isEmpty() && currentLetters.length > 1) {
+            letters = currentLetters
+            results = currentLetters.map { it.toString() }
+            val plan = pending
+            if (plan != null && plan.placed == Placement.OK) {
+                return skipUnplacedHand(currentLetters, plan)
+            }
+            pending = null
+            note = "Đã đồng bộ cầu hiện có (${currentLetters.length} tay); đánh từ ván kế tiếp."
             return if (arm()) Step.ARMED else Step.PAUSED
         }
 
@@ -210,54 +224,31 @@ class Session(
         }
 
         if (plan.placed == Placement.PENDING) {
+            // Chưa có xác nhận đặt chip. SUY ĐOÁN ở đây là nguy hiểm: nếu chip đã lên
+            // thật thì bỏ qua sẽ làm sai cả thang gấp thếp; nếu chip chưa lên thì chờ
+            // mãi sẽ treo phiên. Vì vậy KHÔNG quyết định trong lớp logic thuần — runner
+            // đọc chip trên bàn để xác nhận rồi mới gọi lại (xem [Runner.verifyPending]).
             note = "Chờ xác nhận đã đặt chip thật xong rồi mới tính tay này."
             plan.firstResultSeenAt = plan.firstResultSeenAt ?: now()
             return Step.IDLE
         }
         if (plan.placed == Placement.FAILED) return skipUnplacedHand(currentLetters, plan)
 
-        // Giữ cầu làm mốc để lần đọc sau còn đối chiếu, rồi cân tay bằng cùng một đường
-        // với kết quả WebSocket (một chỗ tính tiền duy nhất, không lệch logic).
+        // Giữ cầu làm mốc để lần đọc sau còn đối chiếu, rồi cân tay.
         letters = currentLetters
         results = currentLetters.map { it.toString() }
         return settleHand(result, plan)
     }
 
-    /**
-     * Kết quả một ván lấy TRỰC TIẾP từ WebSocket của bàn (không đọc cầu).
-     *
-     * Đây là đường chính khi bàn có WebSocket: server báo cửa thắng ngay khi ván kết
-     * thúc, chính xác tuyệt đối — không lệch khi cầu loạn, không cần chờ cầu render,
-     * không phụ thuộc selector DOM của bảng cầu.
-     *
-     * @param winner "B" | "P" | "T"
-     * @param seq    số thứ tự ván server báo, để không xử lý trùng
-     */
-    fun applyRound(winner: String, seq: Long): Step {
-        if (!running) return Step.IDLE
-        if (seq > 0 && seq <= lastRoundSeq) return Step.IDLE
-        if (seq > 0) lastRoundSeq = seq
-
-        val plan = pending
-        // Chưa chốt kế hoạch (đang đặt dở) thì bỏ qua ván này, không tính tiền.
-        if (plan == null) return Step.IDLE
-        if (plan.placed == Placement.PENDING) {
-            note = "Chờ xác nhận đã đặt chip thật xong rồi mới tính tay này."
-            plan.firstResultSeenAt = plan.firstResultSeenAt ?: now()
-            return Step.IDLE
-        }
-        if (plan.placed == Placement.FAILED) return skipUnplacedHand(letters, plan)
-        return settleHand(winner, plan)
-    }
-
     /** Ghi nhận một tay đã đặt: cân vốn, đổi bậc/cửa, rồi chốt kế hoạch kế tiếp. */
     private fun settleHand(result: String, plan: Plan): Step {
         placeSkips = 0
+        // KHÔNG ghi thêm ký tự vào `letters`/`results` ở đây: nơi gọi đã đồng bộ cả hai
+        // theo đúng cầu vừa đọc. Cộng thêm sẽ làm mốc cầu dài hơn cầu thật một ký tự,
+        // khiến nhịp sau hiểu nhầm là "cầu đổi gốc" và xoá mất kế hoạch vừa chốt.
         val settlement = money.settle(plan.side, result, plan.stake)
         val (nextState, _) = Method.advance(method, result, plan.side, plan.stake)
         method = if (fixedStake > 0) nextState.copy(ladderStep = 0) else nextState
-        results = results + result
-        letters = letters + result
         log.add(
             HandRecord(
                 at = now(),
@@ -370,6 +361,32 @@ class Session(
 
     /** Kế hoạch đang chờ — runner cầm object này để báo kết quả đặt chip. */
     fun pendingPlan(): Plan? = pending
+
+    /**
+     * Cập nhật lời nhắn cho kế hoạch đang chờ mà KHÔNG đổi trạng thái đặt chip.
+     *
+     * Dùng khi lượt đặt trượt vì lý do tạm thời (bàn còn chip ván trước, cửa sổ cược
+     * chưa mở): kế hoạch vẫn PENDING nên runner thử lại ngay ở nhịp sau, trong cùng
+     * cửa sổ cược, thay vì bỏ luôn tay đó.
+     */
+    fun pendingNote(text: String) {
+        if (pending == null) return
+        note = text
+    }
+
+    /**
+     * Xử lý NGAY một kế hoạch đã thất bại, không chờ ký tự cầu mới.
+     *
+     * Nếu chỉ dựa vào [process] thì kế hoạch FAILED sẽ nằm chờ tới ván sau mới được tiêu
+     * thụ; khi bàn tạm dừng (đổi shoe, hết phiên) hoặc đang ngoài bàn thì phiên đứng im.
+     * Gọi hàm này mỗi nhịp để giữ chuỗi đánh liền mạch: giữ nguyên cửa + bậc, đánh lại.
+     */
+    fun absorbFailedPlan(): Step {
+        if (!running) return Step.IDLE
+        val plan = pending ?: return Step.IDLE
+        if (plan.placed != Placement.FAILED) return Step.IDLE
+        return skipUnplacedHand(letters, plan)
+    }
 
     fun markPlacing() {
         pending?.let {

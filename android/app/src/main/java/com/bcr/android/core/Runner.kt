@@ -42,14 +42,12 @@ class Runner(
     @Volatile var frames: Int = 0
     @Volatile var readNote: String = ""
     @Volatile var busy: Boolean = false
-    /** Số ván đã nhận được từ WebSocket của bàn (0 = bàn không dùng WS / chưa bắt được). */
-    @Volatile var wsRounds: Int = 0
+    /** Ghi chú của lượt đặt chip gần nhất (để báo đúng lý do khi phải thử lại). */
+    @Volatile private var lastPlaceNote: String = ""
     @Volatile private var lastError: String = ""
 
     private var stableLetters: String = ""
     private var stableCount = 0
-    /** Mốc thời gian ván WebSocket đã xử lý — chặn đếm trùng một ván. */
-    private var lastWsSeq: Long = 0
     /** Chặn hai luồng cùng bấm chip cho một kế hoạch. */
     private val planClaim = AtomicBoolean(false)
     private var entered = false
@@ -66,8 +64,6 @@ class Runner(
         entered = false
         stableLetters = ""
         stableCount = 0
-        wsRounds = 0
-        lastWsSeq = 0
         lastError = ""
         thread = Thread({ loop() }, "bcr-runner").apply {
             isDaemon = true
@@ -291,8 +287,8 @@ class Runner(
         liveTableId = scan.tableId
         liveTableName = scan.name
         liveLetters = scan.letters
-        // Phương pháp 1-1 không xét cầu trước đó và kết quả tay lấy từ WebSocket, nên
-        // vào bàn là chốt kế hoạch Banker ngay — không chờ cầu render.
+        // Phương pháp 1-1 không xét cầu trước đó, nên vào bàn là chốt kế hoạch Banker
+        // ngay — không chờ cầu render.
         val check = Method.checkTable(scan.letters.length, session.minHands, session.maxHands)
         if (!check.eligible) {
             fail(
@@ -329,8 +325,8 @@ class Runner(
         while (running.get() && System.currentTimeMillis() < deadline) {
             val scan = scanTable()
             if (scan != null) {
-                // Có bàn là đủ để bắt đầu: phương pháp 1-1 không xét cầu trước đó, và
-                // kết quả tay lấy từ WebSocket nên cũng không cần chờ cầu render.
+                // Có bàn là đủ để bắt đầu: phương pháp 1-1 không xét cầu trước đó nên
+                // không cần chờ cầu render.
                 return scan
             } else if (inTableByUrl()) {
                 lastError = "Bàn đang tải…"
@@ -403,40 +399,69 @@ class Runner(
     }
 
     private fun tick() {
-        // Ưu tiên WebSocket: có kết quả ván là cân tay ngay, không chờ cầu render và
-        // không lệch khi cầu loạn. Cầu chỉ còn là đường dự phòng khi bàn không có WS.
-        if (tickRound()) return
+        // Kế hoạch PENDING quá lâu: đọc chip THẬT trên bàn để quyết định, không đoán.
+        resolveStalePending()
 
-        // Đã biết bàn rồi thì KHÔNG quét lại toàn trang mỗi nhịp: mỗi lần quét tốn tới
-        // 3,2 giây nên vòng lặp bị trễ và bỏ lỡ cửa sổ đặt cược của ván kế tiếp. Cầu
-        // cũng không cần nữa vì kết quả lấy từ WebSocket.
-        if (liveInTable && liveTableId.isNotBlank()) {
-            // Chỉ đặt khi đang có kế hoạch chờ và bàn đã sạch chip.
+        // Kế hoạch đã thất bại: tiêu thụ ngay, không chờ ký tự cầu mới (bàn tạm dừng thì
+        // sẽ treo phiên). Giữ nguyên cửa + bậc, đánh lại ván kế tiếp.
+        when (session.absorbFailedPlan()) {
+            Step.ARMED -> placeIfNeeded()
+            Step.PAUSED -> {
+                running.set(false)
+                return
+            }
+            Step.IDLE -> Unit
+        }
+
+        // Đọc cầu bằng lệnh NHẸ (`road`): chỉ lấy chuỗi ký tự bảng cầu, không quét sảnh
+        // và không đọc khay chip. Trước đây mỗi nhịp gọi `scan` tốn tới 3,2 giây nên
+        // vòng lặp trễ và bỏ lỡ cửa sổ cược của ván kế tiếp.
+        val road = readRoad()
+        if (road == null) {
+            // Chưa đọc được bàn: thử quét đầy đủ để tự vào bàn từ sảnh.
+            val scan = scanTable()
+            if (scan == null) {
+                if (entered) {
+                    liveInTable = false
+                    fail(
+                        "Không còn đọc được bàn đang mở. Hãy mở lại bàn rồi bấm BẮT ĐẦU."
+                    )
+                }
+                return
+            }
+            liveInTable = true
+            liveTableId = scan.tableId
+            liveTableName = scan.name
+            liveLetters = scan.letters
+            entered = true
+            if (session.pendingPlan() == null) {
+                val step = session.process(scan.letters)
+                if (step == Step.ARMED) placeIfNeeded()
+                if (step == Step.PAUSED) running.set(false)
+            }
+            return
+        }
+
+        liveInTable = true
+        if (road.tableId.isNotBlank()) liveTableId = road.tableId
+        liveLetters = road.letters
+
+        // Cầu chưa render xong thì chưa có mốc để so — nhưng kế hoạch vẫn được giữ và
+        // đặt như bình thường (phương pháp 1-1 không cần cầu trước đó).
+        if (road.letters.isBlank()) {
             if (session.pendingPlan() != null) placeIfNeeded()
             return
         }
 
-        val scan = scanTable()
-        if (scan == null) {
-            liveInTable = false
-            fail("Không còn đọc được bàn đang mở. Hãy mở lại bàn rồi bấm BẮT ĐẦU.")
-            return
-        }
-        liveInTable = true
-        liveTableId = scan.tableId
-        liveTableName = scan.name
-        liveLetters = scan.letters
-
         // Chỉ tin cầu khi hai lần đọc liên tiếp giống nhau (tránh đọc lúc React đang render).
-        if (scan.letters != stableLetters) {
-            stableLetters = scan.letters
+        if (road.letters != stableLetters) {
+            stableLetters = road.letters
             stableCount = 0
-            return
+        } else {
+            stableCount += 1
         }
-        stableCount += 1
-        if (stableCount < 2) return
 
-        val step = session.process(scan.letters)
+        val step = session.process(road.letters)
         if (readNote.isNotBlank()) lastError = readNote
         when (step) {
             Step.ARMED -> placeIfNeeded()
@@ -445,76 +470,121 @@ class Runner(
                 // người dùng đọc lời nhắn rồi bấm BẮT ĐẦU lại.
                 running.set(false)
             }
-            Step.IDLE -> Unit
+            Step.IDLE -> {
+                // Không có kết quả mới: vẫn phải thử đặt nếu kế hoạch còn chờ (đây là
+                // nhịp đặt chip chính, không phải chờ kết quả).
+                if (session.pendingPlan() != null) placeIfNeeded()
+            }
         }
     }
 
     /**
-     * Đọc kết quả ván trực tiếp từ WebSocket của bàn và cân tay vừa đặt.
+     * Giải quyết kế hoạch PENDING bị treo: đọc chip THẬT trên bàn rồi mới kết luận.
      *
-     * Đây là đường CHÍNH khi bàn có WebSocket: server báo cửa thắng ngay khi ván kết
-     * thúc nên không phải chờ cầu render, không lệch khi cầu loạn. Trả true khi đã
-     * xử lý một ván mới (để vòng lặp bỏ qua đường đọc cầu trong nhịp đó).
+     * Trước đây nếu vòng lặp trượt cửa sổ cược mà chip vẫn chưa lên, kế hoạch kẹt ở
+     * PENDING vĩnh viễn và cả phiên đứng im. Ở đây chỉ hành động khi đã quá hạn chờ và
+     * bàn đã SẠCH chip (hoặc chip đúng bằng mức cần đặt) — tức là đã có bằng chứng rõ.
      */
-    private fun tickRound(): Boolean {
-        val replies = bridge.call(
-            "round", JSONObject(), timeoutMs = 350, quietMs = 60,
-            until = { it.ok && it.result?.optJSONObject("round") != null }
-        )
-        // Chọn khung báo ván MỚI NHẤT (khung bàn thật có WebSocket của Evolution).
-        val best = replies.asSequence()
-            .mapNotNull { r -> r.result?.optJSONObject("round")?.let { r to it } }
-            .filter { it.second.optString("winner").isNotBlank() }
-            .maxByOrNull { it.second.optLong("at", 0L) }
-            ?: return false
+    private fun resolveStalePending() {
+        val plan = session.pendingPlan() ?: return
+        if (plan.placed != Placement.PENDING) return
+        val waited = System.currentTimeMillis() - plan.armedAt
+        if (waited < PENDING_GRACE_MS) return
+        if (plan.placingAt == 0L) return   // chưa từng thử bấm → nhịp sau sẽ bấm
 
-        val round = best.second
-        val winner = round.optString("winner").uppercase().take(1)
-        if (winner != "B" && winner != "P" && winner != "T") return false
-        val seq = round.optLong("at", 0L)
-        if (seq <= lastWsSeq) return false
-        lastWsSeq = seq
-        wsRounds += 1
+        val chips = readChips() ?: return
+        if (!chips.optBoolean("has_table")) return
+        val amount = chips.optJSONObject("spots")?.optJSONObject(plan.side)
+            ?.optDouble("amount") ?: 0.0
 
-        val step = session.applyRound(winner, seq)
-        when (step) {
-            Step.ARMED -> placeIfNeeded()
-            Step.PAUSED -> running.set(false)
-            Step.IDLE -> Unit
+        if (amount + 0.5 >= plan.stake) {
+            // Chip ĐÃ lên bàn thật → tính là đã đặt; kết quả tay này sẽ được cân bình thường.
+            session.markPlaced(
+                true,
+                "Đã xác nhận chip trên bàn (${Fmt.money(amount)} VN2) sau khi chờ.",
+                plan
+            )
+            return
         }
-        return step != Step.IDLE
+        // Bàn sạch, không có chip của ta → chưa đặt được đồng nào. Trả về như lượt trượt:
+        // giữ nguyên cửa + bậc, đánh lại ván kế tiếp.
+        session.markPlaced(
+            false,
+            "Hết thời gian chờ mà chip không lên bàn (ô ${Method.sideName(plan.side)} = " +
+                "${Fmt.money(amount)}).",
+            plan
+        )
     }
+
+    /** Cầu đọc bằng lệnh nhẹ `road`. Null khi chưa vào bàn / chưa có bảng cầu. */
+    private data class Road(val tableId: String, val letters: String)
+
+    private fun readRoad(): Road? {
+        val replies = bridge.call(
+            "road", JSONObject(), timeoutMs = 900, quietMs = 60,
+            until = { it.ok && it.result?.optString("letters").orEmpty().isNotBlank() }
+        )
+        val best = replies
+            .filter { it.ok && it.result != null }
+            .maxByOrNull { it.result?.optString("letters").orEmpty().length }
+            ?: return null
+        val result = best.result ?: return null
+        val letters = result.optString("letters")
+        val tableId = result.optString("table_id")
+        // Chưa vào bàn và cũng chưa thấy cầu: coi như không đọc được bàn.
+        if (tableId.isBlank() && letters.isBlank()) return null
+        return Road(tableId, letters)
+    }
+
 
     // ------------------------------------------------------------------ đặt chip
 
     private fun placeIfNeeded() {
         val plan = session.pendingPlan() ?: return
         if (plan.placed != Placement.PENDING) return
-        // Chỉ đặt MỘT lần cho mỗi kế hoạch, và không chen giữa lúc đang bấm.
-        if (!planClaim.compareAndSet(false, true)) return
         if (!autoPlace) {
             session.markPlaced(false, "Đang tắt tự đặt chip.", plan)
-            planClaim.set(false)
             return
         }
+        // Chặn hai luồng cùng bấm chip cho một kế hoạch.
+        if (!planClaim.compareAndSet(false, true)) return
         busy = true
+        session.markPlacing()
+        val reason: String
         try {
-            if (!placeReal(plan)) retryWithTouch(plan)
+            reason = tryPlace(plan)
         } finally {
             busy = false
             planClaim.set(false)
         }
+        if (reason == PLACE_OK) return
+
+        // Lỗi "chắc chắn không đặt được" (vượt hạn mức bàn, không ghép được mệnh giá):
+        // đánh dấu thất bại để session xử lý như một lượt trượt.
+        if (reason in FATAL_PLACE_ERRORS) {
+            session.markPlaced(false, lastPlaceNote, plan)
+            return
+        }
+        // Lỗi TẠM THỜI (bàn còn chip ván trước, cửa sổ cược chưa mở, xác nhận chưa kịp):
+        // GIỮ nguyên kế hoạch ở trạng thái chờ và thử lại ngay ở nhịp sau — vẫn trong
+        // cùng cửa sổ cược. Trước đây mỗi lần trượt là bỏ luôn tay, nên các tay bị nhảy
+        // cách quãng 2, 4, 15, 17, 18.
+        session.pendingNote(
+            "Chưa đặt được (${lastPlaceNote.ifBlank { reason }}) — đang thử lại trong cửa sổ cược."
+        )
     }
 
-    private fun placeReal(plan: Plan): Boolean {
+    /** Kết quả đặt chip: xong, lỗi tạm thời (thử lại), hay lỗi chắc chắn không đặt được. */
+    private fun tryPlace(plan: Plan): String {
         val args = JSONObject()
             .put("side", plan.side)
             .put("amount", plan.stake)
             .put("clickDelayMs", clickDelayMs)
-            .put("waitMs", 9000)
-            .put("waitClearMs", 22000)
+            // Giữ ngắn: chờ quá lâu sẽ lấn sang ván sau và đặt nhầm ván đã có kết quả.
+            .put("waitMs", 5000)
+            .put("waitClearMs", 7000)
         val replies = bridge.call(
-            "place", args, timeoutMs = 40000, quietMs = 150,
+            "place", args, timeoutMs = 20000, quietMs = 120,
             // Khung chứa bàn trả lời ok=true khi đã đặt xong; các khung khác trả lời
             // nhanh "không có bàn" nên phải chờ đúng khung có bàn thay vì thoát sớm.
             until = { it.result?.optBoolean("ok") == true }
@@ -522,15 +592,36 @@ class Runner(
         val ok = replies.firstOrNull { it.result?.optBoolean("ok") == true }
         if (ok != null) {
             session.markPlaced(true, ok.result?.optString("note").orEmpty(), plan)
-            return true
+            return PLACE_OK
         }
-        val note = replies.asSequence()
+
+        // Không xác nhận được qua trả lời: đọc lại ô cược xem chip có lên THẬT không.
+        // Đây là chốt chặn đặt đôi — thà nhận là đã đặt còn hơn đặt thêm lần nữa.
+        val amount = readChips()?.optJSONObject("spots")?.optJSONObject(plan.side)
+            ?.optDouble("amount") ?: 0.0
+        if (amount + 0.5 >= plan.stake) {
+            session.markPlaced(
+                true,
+                "Đã xác nhận chip trên bàn (${Fmt.money(amount)} VN2).",
+                plan
+            )
+            return PLACE_OK
+        }
+
+        val reason = replies.asSequence()
+            .mapNotNull { it.result?.optString("reason")?.takeIf(String::isNotBlank) }
+            .firstOrNull()
+            ?: "no_reply"
+        lastPlaceNote = replies.asSequence()
             .mapNotNull { it.result?.optString("note")?.takeIf(String::isNotBlank) }
             .firstOrNull()
             ?: replies.firstOrNull()?.error?.takeIf(String::isNotBlank)
             ?: "không phản hồi từ trang bàn"
-        session.markPlaced(false, note, plan)
-        return false
+
+        // Site có thể chặn sự kiện chuột tổng hợp: thử bấm cảm ứng thật NGAY trong lượt
+        // này thay vì để mất cả tay.
+        if (reason !in FATAL_PLACE_ERRORS && retryWithTouch(plan)) return PLACE_OK
+        return reason
     }
 
     /**
@@ -658,5 +749,26 @@ class Runner(
          * 1 VN2 = 1.000đ → 20 VN2 = 20.000đ (mệnh giá chip nhỏ nhất của bàn Evolution).
          */
         const val BASE_UNIT = 20.0
+
+        /** Lượt đặt đã xong — không cần thử lại. */
+        private const val PLACE_OK = "ok"
+
+        /**
+         * Thời gian ân hạn cho một kế hoạch PENDING trước khi đọc chip thật để kết luận.
+         * Đủ dài để không cắt ngang một lượt bấm đang chạy, đủ ngắn để không treo phiên.
+         */
+        private const val PENDING_GRACE_MS = 12_000L
+
+        /**
+         * Lỗi mà thử lại cũng vô ích: bậc vượt hạn mức bàn, hoặc số tiền không ghép
+         * được bằng mệnh giá chip. Gặp mấy lỗi này thì trả tay về session như một lượt
+         * trượt (giữ nguyên cửa/bậc, không đụng vốn).
+         */
+        private val FATAL_PLACE_ERRORS = setOf(
+            "over_table_limit",
+            "ungroupable",
+            "bad_side",
+            "bad_amount"
+        )
     }
 }

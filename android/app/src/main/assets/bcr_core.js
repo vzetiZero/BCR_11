@@ -29,120 +29,16 @@
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
-  /* ============================ thu khung WebSocket ============================
+  /* ============================== nguồn kết quả ==============================
    *
-   * Bàn Baccarat của nhà cái báo kết quả ván qua WebSocket. Đọc khung đó chính xác
-   * hơn hẳn đọc cầu bằng DOM: không phụ thuộc selector, không lệch khi cầu loạn,
-   * không nhầm khi đổi shoe. Ở đây CHỈ ĐỌC — không gửi gì lên server, không sửa
-   * khung, nên không can thiệp vào phiên chơi của người dùng.
+   * Script này KHÔNG đụng vào bất kỳ API mạng nào của trang (không thay `WebSocket`,
+   * không `fetch`, không `XMLHttpRequest`). Bản v1.8 từng thay `window.WebSocket` để
+   * nghe khung mạng — chính chỗ đó làm đứt prototype chain và khiến nhà cái đá phiên
+   * ngay khi ván bắt đầu, nên đã gỡ sạch.
    *
-   * `WebSocket` được thay bằng lớp bọc giữ nguyên toàn bộ hành vi gốc: mọi thứ trang
-   * gửi/nhận vẫn đi đúng đường. Bộ thu chỉ ghi lại ván đã kết thúc để native hỏi.
+   * Kết quả tay giờ đọc từ BẢNG CẦU của bàn: mỗi ván mới là một ô `roadItem` mới. Đó
+   * là dữ liệu trang vốn đã công khai cho người chơi, nên không có gì để site phát hiện.
    */
-
-  // Ván gần nhất server báo đã có kết quả: { at, table, winner, shoe, round }.
-  var lastRound = null;
-  // Đếm số khung đã đọc, để native biết bộ thu có thật sự bắt được gì không.
-  var wsSeen = 0;
-  var WS_MAX_KEEP = 40;
-
-  /** Chuẩn hoá tên cửa thắng về B/P/T. */
-  function normWinner(raw) {
-    if (raw === null || raw === undefined) return '';
-    var s = String(raw).trim().toUpperCase();
-    if (!s) return '';
-    // Evolution dùng "Banker"/"Player"/"Tie" hoặc 1/2/3 hoặc "B"/"P"/"T".
-    if (s === 'B' || s === 'BANKER' || s === '1') return 'B';
-    if (s === 'P' || s === 'PLAYER' || s === '2') return 'P';
-    if (s === 'T' || s === 'TIE' || s === '3') return 'T';
-    return '';
-  }
-
-  /** Lấy giá trị đầu tiên khớp trong danh sách khoá (không phân biệt hoa thường). */
-  function pick(obj, keys) {
-    if (!obj || typeof obj !== 'object') return undefined;
-    var lowerMap = {};
-    for (var k in obj) {
-      if (Object.prototype.hasOwnProperty.call(obj, k)) lowerMap[String(k).toLowerCase()] = obj[k];
-    }
-    for (var i = 0; i < keys.length; i++) {
-      var v = lowerMap[String(keys[i]).toLowerCase()];
-      if (v !== undefined && v !== null) return v;
-    }
-    return undefined;
-  }
-
-  /** Dò một object bất kỳ tìm thông tin "ván đã kết thúc". */
-  function readRoundFrom(obj, depth) {
-    if (!obj || typeof obj !== 'object' || depth > 6) return null;
-    var winner = normWinner(pick(obj, [
-      'winner', 'winningoutcome', 'result', 'outcome', 'winningside',
-      'winnercode', 'resultcode'
-    ]));
-    if (winner) {
-      return {
-        winner: winner,
-        table: String(pick(obj, ['tableid', 'table_id', 'tableidcode']) || ''),
-        shoe: String(pick(obj, ['shoeid', 'shoe_id', 'shoe']) || ''),
-        round: String(pick(obj, ['roundid', 'round_id', 'gameid', 'round']) || '')
-      };
-    }
-    // Đi sâu vào object lồng nhau (payload bọc nhiều lớp).
-    for (var k in obj) {
-      if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
-      var v = obj[k];
-      if (v && typeof v === 'object') {
-        var found = readRoundFrom(v, depth + 1);
-        if (found) return found;
-      }
-    }
-    return null;
-  }
-
-  /** Ghi một khung nhận được: chỉ giữ lại nếu nó báo kết quả ván. */
-  function tapFrame(data) {
-    if (typeof data !== 'string' || data.length < 12 || data.length > 200000) return;
-    // Lọc nhanh trước khi JSON.parse: phần lớn khung không liên quan.
-    if (!/result|winner|outcome/i.test(data)) return;
-    wsSeen += 1;
-    var parsed;
-    try { parsed = JSON.parse(data); } catch (e) { return; }
-    var round = readRoundFrom(parsed, 0);
-    if (!round) return;
-    // Bỏ qua nếu trùng đúng ván vừa ghi (server hay gửi lặp).
-    if (lastRound && round.round && lastRound.round === round.round &&
-        lastRound.winner === round.winner) return;
-    round.at = Date.now();
-    round.seq = (lastRound ? lastRound.seq + 1 : 1);
-    lastRound = round;
-  }
-
-  // Tách nhiều khung nối bằng ký tự xuống dòng (một số sòng gộp batch).
-  function tapFrames(raw) {
-    if (typeof raw !== 'string') return;
-    if (raw.indexOf('\n') === -1) { tapFrame(raw); return; }
-    raw.split('\n').forEach(function (line) { if (line) tapFrame(line); });
-  }
-
-  (function installWsTap() {
-    var Native = window.WebSocket;
-    if (!Native || Native.__bcrTapped) return;
-    function BcrWebSocket(url, protocols) {
-      var ws = protocols === undefined ? new Native(url) : new Native(url, protocols);
-      try {
-        ws.addEventListener('message', function (ev) { tapFrames(ev.data); });
-      } catch (e) { /* bỏ qua: chỉ là tính năng phụ trợ */ }
-      return ws;
-    }
-    // Giữ nguyên prototype/static để mọi thư viện dùng `instanceof` vẫn đúng.
-    BcrWebSocket.prototype = Native.prototype;
-    BcrWebSocket.CONNECTING = Native.CONNECTING;
-    BcrWebSocket.OPEN = Native.OPEN;
-    BcrWebSocket.CLOSING = Native.CLOSING;
-    BcrWebSocket.CLOSED = Native.CLOSED;
-    BcrWebSocket.__bcrTapped = true;
-    try { window.WebSocket = BcrWebSocket; } catch (e) { /* bỏ qua */ }
-  })();
 
   /* ============================== cầu nối native ============================== */
 
@@ -605,6 +501,48 @@
       });
     });
     return { roads: roads, scanned: roads.length };
+  }
+
+  /**
+   * Đọc cầu NHẸ cho vòng lặp: chỉ lấy chuỗi ký tự của bảng cầu, không quét sảnh,
+   * không đọc khay chip. Trả về cầu DÀI NHẤT tìm được (bàn thật có thể có nhiều bảng).
+   *
+   * Đây là nguồn kết quả của app: mỗi ván mới = một ô `roadItem` mới ở cuối cầu, nên
+   * native so độ dài để biết tay mình vừa thắng hay thua. Không đụng API mạng của trang.
+   */
+  function roadOnly() {
+    var best = '';
+    var source = '';
+    var tid = tableIdFromUrl();
+
+    var bead = beadRoads();
+    for (var i = 0; i < bead.roads.length; i++) {
+      if (bead.roads[i].letters.length > best.length) {
+        best = bead.roads[i].letters;
+        source = 'bead';
+      }
+    }
+
+    // Bàn mới render bằng canvas: đọc thêm nếu cầu DOM chưa có.
+    if (!best.length) {
+      var evo = canvasRoads();
+      for (var j = 0; j < evo.roads.length; j++) {
+        if (evo.roads[j].letters.length > best.length) {
+          best = evo.roads[j].letters;
+          source = 'canvas';
+        }
+      }
+    }
+
+    return {
+      ok: true,
+      in_table: !!tid,
+      table_id: tid,
+      letters: best,
+      hands: best.length,
+      source: source,
+      road_items: document.querySelectorAll('[data-role="roadItem"][name]').length
+    };
   }
 
   /* ================================= quét trang ================================= */
@@ -1272,17 +1210,14 @@
         return { ok: true, url: location.href, has_table_id: /[#?&]table_id=/.test(location.href) };
       case 'chips':
         return readChips();
+      case 'road':
+        // Đọc cầu nhẹ: chỉ đếm ô cầu và lấy chuỗi ký tự, KHÔNG quét sảnh/khay chip.
+        // Dùng mỗi nhịp của vòng lặp nên phải rẻ (trước đây gọi `scan` tốn tới 3,2s).
+        return roadOnly();
       case 'round':
-        // Kết quả ván gần nhất bắt được từ WebSocket của bàn.
-        // Native dùng số thứ tự `seq` để biết đã xử lý ván nào rồi.
-        return {
-          ok: true, round: lastRound, seq: lastRound ? lastRound.seq : 0,
-          ws_frames: wsSeen, tapped: !!window.WebSocket.__bcrTapped
-        };
-      case 'round_reset':
-        lastRound = null;
-        wsSeen = 0;
-        return { ok: true };
+        // ĐÃ BỎ. Kết quả ván giờ đọc từ bảng cầu qua lệnh `road` — không cần WebSocket,
+        // nên không có gì can thiệp vào kết nối mạng của trang.
+        return { ok: false, reason: 'removed', note: 'Dùng lệnh road.' };
       case 'probe':
         return probeTable();
       case 'place':
