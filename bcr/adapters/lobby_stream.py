@@ -17,8 +17,6 @@ from bcr.adapters import browser as BR
 from bcr.adapters import human_mouse as HM
 from bcr.adapters import table_bets as TB
 
-from bcr.models.longlong import die_of, normalize_result
-
 HISTORY_TYPES = ("lobby.histories", "lobby.historyUpdated")
 SIDE_BY_COLOR = {"R": "B", "B": "P"}
 SPECIAL_IDS = frozenset((
@@ -36,28 +34,6 @@ RETURN_STEP_WAIT = 8.0
 # Hash mặc định của danh sách bàn Baccarat khi hash đang ở màn hình bàn không còn
 # tham số nào khác ngoài table_id.
 LOBBY_LIST_FRAGMENT = "category=all_games&game=baccarat&see=baccarat"
-
-# Hồ sơ sảnh theo từng trò. Baccarat giữ nguyên hành vi cũ (mặc định). LONG-LONG dùng
-# hash riêng và chỉ đọc ô bàn của game đó; không đụng logic đọc cầu Baccarat.
-GAME_BACCARAT = {
-    "key": "baccarat",
-    "fragment": LOBBY_LIST_FRAGMENT,
-    "game_types": ("baccarat", "luckybaccarat"),
-}
-# LONG-LONG nằm trong nhóm instant games của Evolution. Hash dưới đây là giá trị mặc
-# định; nếu sàn đổi mã game thì chỉ cần sửa hai chỗ: ``fragment`` và ``game_types``.
-GAME_LONGLONG = {
-    "key": "longlong",
-    "fragment": "category=instant_games&game=rng-longlong",
-    "game_types": ("rng-longlong", "longlong", "long-long", "long_long"),
-}
-
-
-def game_profile(key="baccarat"):
-    """Trả hồ sơ sảnh theo tên trò; lạ thì về Baccarat để hành vi cũ không đổi."""
-    return GAME_LONGLONG if str(key or "").lower() in (
-        "longlong", "long_long", "long-long", "long") else GAME_BACCARAT
-
 
 
 def decode_results(results):
@@ -84,54 +60,6 @@ def decode_results(results):
         if isinstance(first, dict) and first.get("ties"):
             return letters, "Ô đầu có hòa: Big Road không cho biết hòa trước hay sau tay đầu."
     return letters, ""
-
-
-def _raws_from_cells(cells):
-    """Đổi các ô của MỘT dãy lịch sử thành danh sách bộ VV/DD/VD/DV.
-
-    Sàn có thể ghi mỗi tay bằng một ô (đã là cả bộ) hoặc bằng hai ô liền nhau (mỗi ô
-    một con xúc xắc). Thử cách hiểu "mỗi ô một mặt" trước — nhận ra được thì ghép cặp;
-    không thì hiểu mỗi ô là một bộ. Ô lạ thì trả None để bỏ cả dãy, không đoán.
-    """
-    if cells:
-        dice = [die_of(value) for value in cells]
-        if all(die is not None for die in dice) and len(dice) >= 2:
-            if len(dice) % 2:
-                dice = dice[:-1]        # tay đang chơi chưa đủ hai bát: bỏ tay cuối
-            return ["".join(dice[i:i + 2]) for i in range(0, len(dice), 2)]
-    raws = []
-    for value in cells:
-        raw = normalize_result(value)
-        if raw is None:
-            return None
-        raws.append(raw)
-    return raws
-
-
-def decode_longlong_results(grids):
-    """Ghép các dãy kết quả LONG-LONG thành danh sách bộ (mới nhất cuối).
-
-    Mỗi tay là một bộ VV/DD/VD/DV. Dãy nào có ô không đọc được thì bỏ cả dãy và báo
-    lỗi thay vì đoán kết quả. Nhiều grid (sảnh + bàn) thì dùng dãy DÀI NHẤT làm chuẩn.
-    Trả về (danh_sách_bộ, lỗi).
-    """
-    best = []
-    if not isinstance(grids, list):
-        return [], "Không đọc được lịch sử LONG-LONG."
-    for grid in grids:
-        if not isinstance(grid, list):
-            continue
-        raws = _raws_from_cells(grid)
-        if raws and len(raws) > len(best):
-            best = raws
-    if not best:
-        return [], "Chưa đọc được kết quả LONG-LONG từ lịch sử ô bàn."
-    return best, ""
-
-
-def single_grid_results(values):
-    """Chuẩn hoá kết quả một dãy lịch sử LONG-LONG (dùng cho lượt đọc trong bàn)."""
-    return decode_longlong_results([values])
 
 
 def is_special(table):
@@ -191,34 +119,6 @@ TILES_JS = """(() => {
                 road: fiber ? historyOf(fiber) : null,
                 top: Math.round(tile.getBoundingClientRect().top)};
     }).filter((r) => r.id), scroll: (() => { const sc = pick(); return {top: sc.scrollTop, max: sc.scrollHeight, client: sc.clientHeight}; })()};
-})()"""
-
-# Đọc lịch sử LONG-LONG: mỗi ô [data-role="history-grid"] là một dãy kết quả ván gần
-# nhất. Sàn vẽ kết quả bằng hình (vàng/đỏ) nên ô có thể chỉ có nhãn chữ, aria-label
-# hoặc mã số — đọc cả ba dạng rồi để decoder Python quyết định. Trong ô bàn sảnh và
-# trên màn hình bàn đều dùng cùng role nên một hàm đọc được cả hai chỗ; trả về dãy
-# theo thứ tự cũ -> mới.
-LONG_LONG_HISTORY_JS = r"""(() => {
-    const id = %s;
-    const out = [];
-    for (const grid of document.querySelectorAll('[data-role="history-grid"]')) {
-        if (id) {
-            const tile = grid.closest('[data-role="table-tile"]');
-            const key = tile && Object.keys(tile).find((n) => n.startsWith('__reactFiber$'));
-            let f = key ? tile[key] : null;
-            while (f && !(f.memoizedProps && f.memoizedProps.table && f.memoizedProps.table.id === id)) f = f.return;
-            if (!f) continue;
-        }
-        const token = (n) => ((n.getAttribute && (n.getAttribute('aria-label') || n.getAttribute('title'))) || n.textContent || '')
-            .replace(/\s+/g, ' ').trim().slice(0, 24);
-        const values = [...grid.querySelectorAll('*')]
-            .filter((n) => n.children.length === 0)
-            .map(token)
-            .filter((t) => t && /^[0-9]{1,2}$/.test(t)
-                || /(vàng|vang|gold|yellow|đỏ|\bred\b|hỗn|mix)/i.test(t));
-        if (values.length) out.push(values);
-    }
-    return {grids: out};
 })()"""
 
 SCROLL_JS = """(() => {
@@ -434,21 +334,20 @@ LIST_HASH_JS = """(() => {
 })()"""
 
 
-def lobby_list_url(url, fragment=None):
+def lobby_list_url(url):
     """URL sảnh tổng của chính tab đang mở bàn: giữ origin/path, bỏ table_id.
 
     Giữ các tham số còn lại của hash/query (category, game, see…) để về đúng chế độ
     xem sảnh người dùng đang dùng; không còn gì thì dùng hash danh sách mặc định
-    (``fragment`` truyền vào cho từng trò; mặc định Baccarat).
+    ``LOBBY_LIST_FRAGMENT`` của sảnh Baccarat.
     """
     parsed = urlsplit(url)
 
     def keep(part):
         return [p for p in part.split("&") if p and p.split("=", 1)[0] != "table_id"]
 
-    default_fragment = fragment or LOBBY_LIST_FRAGMENT
     kept = keep(parsed.fragment)
-    fragment_part = "&".join(kept) or default_fragment
+    fragment_part = "&".join(kept) or LOBBY_LIST_FRAGMENT
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
                        "&".join(keep(parsed.query)), fragment_part))
 
@@ -456,10 +355,8 @@ def lobby_list_url(url, fragment=None):
 class LobbyStream:
     """Đọc luồng message sảnh qua CDP chỉ đọc trên Chrome đang mở."""
 
-    def __init__(self, session=None, human_mouse=True, game="baccarat"):
+    def __init__(self, session=None, human_mouse=True):
         self.session = session or BR.BrowserSession()
-        self.profile = game_profile(game)
-        self.game = self.profile["key"]
         self.note = ""
         self.last_error = ""
         self.diag = {}
@@ -719,53 +616,6 @@ class LobbyStream:
                 return context_id, snapshot
             time.sleep(1.5)
 
-    def read_longlong_results(self, table_id=""):
-        """Đọc kết quả LONG-LONG từ lịch sử ô bàn/màn hình bàn hiện tại.
-
-        Trả về (chuỗi 'V'/'D'/'M', lỗi). Không cần WebSocket vì game vẽ lịch sử trực
-        tiếp trong ``[data-role="history-grid"]``. Chỉ đọc, không bấm.
-        """
-        ws = None
-        self.last_error = ""
-        try:
-            page = self.session._cdp_page()
-            if page is None:
-                self.last_error = "Không có tab sảnh LONG-LONG trong Chrome CDP 9222."
-                return "", self.last_error
-            import websocket
-            ws = websocket.create_connection(BR.validated_endpoint(page), suppress_origin=True,
-                                             timeout=BR.SCRIPT_TIMEOUT, redirect_limit=0,
-                                             http_no_proxy=["127.0.0.1", "localhost", "::1"])
-            self._command(ws, "Runtime.enable")
-            context_id = None
-            for candidate in list(self.contexts) or [None]:
-                if candidate is None and len(self.contexts) != 0:
-                    continue
-                value = self._try_value(ws, LONG_LONG_HISTORY_JS % json.dumps(table_id or ""),
-                                        candidate)
-                if isinstance(value, dict) and value.get("grids"):
-                    context_id = candidate
-                    grids = value.get("grids")
-                    break
-            if context_id is None and not self.contexts:
-                # Chưa kịp nhận executionContextCreated: thử context mặc định 1.
-                value = self._try_value(ws, LONG_LONG_HISTORY_JS % json.dumps(table_id or ""), 1)
-                grids = value.get("grids") if isinstance(value, dict) else None
-            if not isinstance(grids, list) or not grids:
-                self.last_error = "Chưa thấy lịch sử LONG-LONG trên trang."
-                return "", self.last_error
-            return decode_longlong_results(grids)
-        except Exception as exc:
-            self.last_error = (BR.CDP_CLOSED_NOTE if BR.cdp_port_closed(exc) else
-                               "Không đọc được kết quả LONG-LONG (%s)." % type(exc).__name__)
-            return "", self.last_error
-        finally:
-            if ws is not None:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
-
     def sweep(self, max_seconds=75, favorites_only=False):
         """Cuộn hết danh sách để sảnh gửi lịch sử mọi bàn, rồi trả về danh sách bàn.
 
@@ -911,63 +761,6 @@ class LobbyStream:
             # Không đưa chi tiết CDP/socket thô vào UI.
             self.last_error = (BR.CDP_CLOSED_NOTE if BR.cdp_port_closed(exc) else
                                "Không quét được luồng sảnh (%s)." % type(exc).__name__)
-            return []
-        finally:
-            if ws is not None:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
-
-    def sweep_longlong(self, max_seconds=45):
-        """Liệt kê bàn LONG-LONG từ DOM sảnh: mã bàn, tên, dãy kết quả từ history-grid."""
-        self._reset()
-        self.note = ""
-        ws = None
-        try:
-            page = self.session._cdp_page()
-            if page is None:
-                self.last_error = "Không có tab sảnh LONG-LONG trong Chrome CDP 9222."
-                return []
-            import websocket
-            ws = websocket.create_connection(BR.validated_endpoint(page), suppress_origin=True,
-                                             timeout=BR.SCRIPT_TIMEOUT, redirect_limit=0,
-                                             http_no_proxy=["127.0.0.1", "localhost", "::1"])
-            self._command(ws, "Runtime.enable")
-            deadline = time.monotonic() + max(1.0, float(max_seconds))
-            snapshot, context_id = None, None
-            while time.monotonic() < deadline:
-                context_id, snapshot = self._lobby_context(ws)
-                if context_id is not None:
-                    break
-                time.sleep(1.5)
-            if context_id is None or not isinstance(snapshot, dict):
-                self.last_error = "Sảnh chưa hiển thị danh sách bàn LONG-LONG."
-                return []
-            tiles = snapshot.get("tiles") or []
-            rows = []
-            for tile in tiles:
-                game_type = (tile.get("game_type") or "").lower()
-                if game_type and game_type not in self.profile["game_types"] and not any(
-                        marker in game_type for marker in ("longlong", "long-long")):
-                    continue
-                table_id = tile.get("id") or ""
-                value = self._try_value(ws, RACE_HISTORY_JS % json.dumps(table_id), context_id)
-                grids = value.get("grids") if isinstance(value, dict) else []
-                letters, error = decode_longlong_results(grids)
-                rows.append({
-                    "table_id": table_id,
-                    "label": tile.get("title") or table_id,
-                    "letters": letters,
-                    "game_type": tile.get("game_type") or "",
-                    "read_error": error,
-                    "source": "evo-longlong-grid",
-                })
-            self.note = "Đọc %d bàn LONG-LONG." % len(rows)
-            return rows
-        except Exception as exc:
-            self.last_error = (BR.CDP_CLOSED_NOTE if BR.cdp_port_closed(exc) else
-                               "Không quét được sảnh LONG-LONG (%s)." % type(exc).__name__)
             return []
         finally:
             if ws is not None:

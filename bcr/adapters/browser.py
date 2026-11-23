@@ -190,28 +190,11 @@ def _clean_report(report):
             or any(not (ch.isalnum() or ch in "_.:-") for ch in table_id)):
         table_id = ""
     frame_url = _safe_url(page.get("url", ""))
-    # Ô lịch sử LONG-LONG: mỗi ván là một nhãn ngắn (số hoặc chữ vàng/đỏ), nên giữ
-    # nguyên token thay vì chỉ nhận chữ số như thời Đua ngựa.
-    longlong = []
-    raw_longlong = report.get("longlong")
-    if isinstance(raw_longlong, list):
-        for grid in raw_longlong[:100]:
-            if not isinstance(grid, dict):
-                continue
-            results = grid.get("results")
-            if not isinstance(results, list):
-                continue
-            values = [str(v).strip()[:24] for v in results[:400]
-                      if isinstance(v, (str, int)) and str(v).strip()]
-            grid_id = grid.get("table_id")
-            grid_id = grid_id if isinstance(grid_id, str) and len(grid_id) <= 80 else ""
-            longlong.append({"table_id": grid_id, "results": values})
     return {
         "page": {"url": frame_url, "table_id": table_id,
                  "title": str(page.get("title") or "")[:80],
                  "wallet_balance": str(page.get("wallet_balance") or "")[:80]},
         "tables": report["tables"],
-        "longlong": longlong,
         "diag": {"kind": diag.get("kind", ""), "scanned": diag.get("scanned", 0),
                  "roads": diag.get("roads", 0), "frame": frame_url,
                  "auth_required": bool(diag.get("auth_required"))},
@@ -420,7 +403,7 @@ class BrowserSession:
 
     @staticmethod
     def _port_open(port=None, timeout=0.6):
-        # Đọc CDP_PORT tại thời điểm gọi: engine đổi cổng theo từng trò (9222/9223).
+        # Đọc CDP_PORT tại thời điểm gọi (engine có thể đặt lại cổng trước khi dùng).
         port = CDP_PORT if port is None else port
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

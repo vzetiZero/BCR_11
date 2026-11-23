@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Bộ kiểm thử của BCR: kiến trúc, engine JSON-RPC, model LONG-LONG, adapter."""
+"""Bộ kiểm thử của BCR: kiến trúc, engine JSON-RPC, model phương pháp 1-1, adapter."""
 
 import pathlib
 import sys

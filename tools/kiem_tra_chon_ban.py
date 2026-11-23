@@ -7,7 +7,7 @@ Cách dùng (Chrome đang mở sảnh Baccarat với CDP 9222):
     python tools/kiem_tra_chon_ban.py --vao-ban    # đọc sảnh rồi bấm ô bàn ĐẦU TIÊN đạt
                                                    # và xác nhận cầu (KHÔNG đặt cược)
 
-Mỗi bàn được chấm bằng đúng bộ lọc của app (5 điều kiện) + 4 cổng kỹ thuật
+Mỗi bàn được chấm bằng đúng điều kiện của app (số tay đã đi) + 4 cổng kỹ thuật
 (dữ liệu ≤ 30 giây, cầu đủ tin, không lỗi/không xung đột, bỏ bàn Siêu Tốc Độ).
 --vao-ban dùng đúng quy trình của nút “VÀO BÀN HỢP LỆ” nhưng dừng ở bước xác nhận:
 không arm kế hoạch, không bấm chip.
@@ -52,10 +52,7 @@ def verdicts(rows, cfg):
     out = []
     for row in rows:
         letters = row.get("letters") or ""
-        hands = len(letters)
-        info = ME.check_table(list(letters), cfg["min_hands"], cfg["max_hands"],
-                              cfg["max_streak"], cfg["min_lead"],
-                              max_lead=cfg["max_lead"], tie_side=cfg["tie_side"])
+        info = ME.check_table(list(letters), cfg["min_hands"], cfg["max_hands"])
         reasons = []
         problem = row_problem(row)
         if problem:
@@ -65,19 +62,20 @@ def verdicts(rows, cfg):
         if is_fast_table(row.get("label")):
             reasons.append("bàn Siêu Tốc Độ")
         if not info["eligible"]:
-            reasons.append("không đạt 5 điều kiện (%s)" % info.get("reason", ""))
+            reasons.append("không đạt điều kiện số tay (%s)" % next(
+                c["detail"] for c in info["checks"] if not c["ok"]))
         out.append({"row": row, "info": info, "reasons": reasons, "ok": not reasons})
     return out
 
 
 def print_board(items):
     width = max([len(str(item["row"].get("label"))) for item in items] + [8])
-    print("%-*s %5s %5s %-7s %s" % (width, "BÀN", "TAY", "LỆCH", "MẠNH", "KẾT LUẬN"))
+    print("%-*s %5s %5s %5s %s" % (width, "BÀN", "TAY", "B", "P", "KẾT LUẬN"))
     for item in items:
         row, info = item["row"], item["info"]
-        print("%-*s %5d %5s %-7s %s" % (
+        print("%-*s %5d %5s %5s %s" % (
             width, str(row.get("label"))[:width], len(row.get("letters") or ""),
-            info.get("lead"), ME.SIDE_NAME.get(info.get("strong"), "—"),
+            info.get("banker"), info.get("player"),
             "ĐẠT" if item["ok"] else "loại · " + "; ".join(item["reasons"])))
 
 
@@ -123,8 +121,6 @@ def main():
 
     cfg = {
         "min_hands": service.sim.min_hands, "max_hands": service.sim.max_hands,
-        "max_streak": service.sim.max_streak, "min_lead": service.sim.min_lead,
-        "max_lead": service.sim.max_lead, "tie_side": service.sim.tie_side,
     }
     items = verdicts(rows, cfg)
     print("\nĐã đọc %d bàn · %d bàn ĐẠT\n" % (

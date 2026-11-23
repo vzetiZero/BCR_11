@@ -1,6 +1,5 @@
-// Electron main: cửa sổ + quản lý engine Python riêng cho từng trò.
-// Mỗi trò = một tiến trình python riêng (profile Chrome + cổng CDP + file cấu hình riêng),
-// nên thao tác ở tab này không ảnh hưởng tab kia.
+// Electron main: cửa sổ + quản lý engine Python của app.
+// Một tiến trình python riêng (profile Chrome + cổng CDP + file cấu hình riêng).
 const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
@@ -234,7 +233,6 @@ class Engine {
 
 const engines = {
   baccarat: new Engine('baccarat'),
-  longlong: new Engine('longlong'),
 };
 
 // Lưới an toàn cuối: Electron biến mọi exception chưa bắt ở main process thành hộp

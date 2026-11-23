@@ -318,33 +318,6 @@ window.__BCR_SCAN = (function () {
     return {roads, scanned: canvases.length};
   }
 
-  /* ---------- LONG-LONG: lịch sử ván trong [data-role="history-grid"] ---------- */
-  function longlongGrids() {
-    const out = [];
-    /* Ô kết quả có thể là ảnh/nhãn màu: đọc aria-label, title hoặc text và giữ token
-       ngắn (số hoặc chữ vàng/đỏ/hỗn). Decoder Python quyết định nghĩa cuối cùng. */
-    const token = (n) => ((n.getAttribute && (n.getAttribute('aria-label') || n.getAttribute('title')))
-      || n.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24);
-    const isResult = (t) => /^[0-9]{1,2}$/.test(t)
-      || /(vàng|vang|gold|yellow|đỏ|\bred\b|hỗn|mix)/i.test(t);
-    document.querySelectorAll('[data-role="history-grid"]').forEach((grid) => {
-      const tile = grid.closest('[data-role="table-tile"]');
-      let tableId = "";
-      if (tile) {
-        const key = Object.keys(tile).find((n) => n.startsWith('__reactFiber$'));
-        let f = key ? tile[key] : null;
-        while (f && !(f.memoizedProps && f.memoizedProps.table && f.memoizedProps.table.id)) f = f.return;
-        if (f) tableId = f.memoizedProps.table.id;
-      }
-      const values = [...grid.querySelectorAll('*')]
-        .filter((n) => n.children.length === 0)
-        .map(token)
-        .filter((t) => t && isResult(t));
-      if (values.length) out.push({table_id: tableId, results: values});
-    });
-    return out;
-  }
-
   return function scan() {
     // Chỉ đọc ví ở sảnh danh sách Baccarat; hash-route độc lập với domain/mirror.
     // Số dư hiển thị ở header khi cửa sổ đủ rộng và chuyển xuống footer khi thu nhỏ,
@@ -396,8 +369,7 @@ window.__BCR_SCAN = (function () {
         letters: r.letters, source: r.source, x: r.box.x, y: r.box.y,
         table_id: r.table_id || '', game_type: r.game_type || '', read_error: r.read_error || ''
       })),
-      diag: { kind, scanned: out.scanned, roads: out.roads.length, frame: location.origin + location.pathname },
-      longlong: longlongGrids()
+      diag: { kind, scanned: out.scanned, roads: out.roads.length, frame: location.origin + location.pathname }
     };
   };
 })();

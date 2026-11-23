@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Kiểm thử engine JSON của Electron (bcr/service/engine.py).
+"""Kiểm thử engine JSON của Electron (bcr/service/engine.py) + phương pháp 1-1.
 
-Không cần Chrome: bàn được thay bằng bàn giả, Chrome bằng đối tượng giả. Mục tiêu là
-khoá lại hợp đồng giữa UI Electron và tiến trình Python:
+Không cần Chrome: Chrome được thay bằng đối tượng giả. Mục tiêu là khoá lại hợp đồng
+giữa UI Electron và tiến trình Python:
 
-    - mỗi trò một service riêng, dispatch đúng method
-    - một ván chỉ chốt một lần (kể cả khi sàn giữ ô thắng nhiều nhịp)
-    - đặt chip thật chỉ chạy khi bật, và chỉ chốt sổ sau khi chip vào
-    - cấu hình được lưu ra file riêng của từng trò
+    - chỉ còn một trò Baccarat, dispatch đúng method
+    - phương pháp 1-1: tay 1 Banker, tay 2 Player… xen kẽ, gấp thếp 8 bậc
+    - chọn bàn chỉ xét số tay đã đi
+    - cấu hình/thang cược được lưu ra file state, chịu được state cũ
 """
 
 import json
@@ -17,29 +17,9 @@ import time
 import unittest
 
 from bcr.adapters import browser as BR
+from bcr.models import engine as E
+from bcr.models import method as ME
 from bcr.service import engine
-from bcr.models import longlong
-
-
-class FakeTable:
-    """Bàn giả: trả lần lượt các state, ghi lại lệnh đặt chip."""
-
-    def __init__(self, states=None):
-        self.states = list(states or [])
-        self.places = []
-        self.closed = False
-        self.place_result = {"ok": True, "placed": [40], "total": 40.0}
-
-    def read(self):
-        state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
-        return dict(state)
-
-    def place(self, amount, door=None, **kwargs):
-        self.places.append(amount)
-        return dict(self.place_result)
-
-    def close(self):
-        self.closed = True
 
 
 class FakeEmitter:
@@ -56,46 +36,102 @@ class FakeEmitter:
         self.events.append(("send", payload))
 
 
-def state(winner=None, raw=None, balance=1000.0, at=1000.0):
-    return {"ok": True, "winner": winner, "winner_raw": raw, "balance_vn2": balance,
-            "total_bet_vn2": 0.0, "status": "ĐẶT CƯỢC CỦA BẠN", "doors": {}, "read_at": at}
+def fake_browser(connected=True, note=""):
+    return type("FakeBrowser", (), {
+        "connected": connected, "note": note, "mode": "cdp" if connected else "",
+        "stop": lambda self: None,
+    })()
 
 
-class FakeStream:
-    """Luồng WebSocket giả: trả về ảnh chụp cố định cho test."""
-
-    def __init__(self, snap=None):
-        self.snap = dict(snap or {"ok": False})
-        self.started = False
-        self.stopped = False
-
-    def start(self):
-        self.started = True
-        return True
-
-    def stop(self):
-        self.stopped = True
-
-    def snapshot(self):
-        return dict(self.snap)
-
-
-def make_service(states=None, config=None, table=None, stream=None):
+def make_service(config=None, path=None):
     folder = pathlib.Path(tempfile.mkdtemp())
-    service = engine.LongLongService(folder / "state.json", FakeEmitter())
-    service.table = table or FakeTable(states or [state()])
-    service.stream = stream or FakeStream()
-    service.browser = type("FakeBrowser", (), {"connected": True, "note": "", "mode": "cdp",
-                                               "stop": lambda self: None})()
+    service = engine.BaccaratService(path or (folder / "state.json"), FakeEmitter())
+    service.browser = fake_browser()
     if config:
-        service.config.update(config)
-        if "ladder" in config:
-            service.sim.set_ladder(config["ladder"])
-        # config_set() mới đẩy tham số vào tracker; ở đây dựng cấu hình qua helper.
-        service.tracker.configure(min_gap=config.get("min_gap"),
-                                  min_hand_gap=config.get("min_hand_gap"),
-                                  confirm=config.get("confirm_reads"))
+        reply = service.config_set(config)
+        assert reply["ok"], reply
     return service
+
+
+def table_row(service, letters, **extra):
+    now = time.time()
+    row = {"key": "id:t1", "label": "Bàn 1", "letters": letters, "ts": now,
+           "table_id": "t1", "game_type": "", "read_error": "", "source": "evo-bead",
+           "conflict": False, "stable": 3, "screen_stable": 3}
+    row.update(extra)
+    service.tables = {"id:t1": row}
+    return row
+
+
+class MethodTests(unittest.TestCase):
+    """Luật 1-1 thuần: xen kẽ B/P, gấp thếp, hoà là hoàn tiền."""
+
+    ROAD = "B" * ME.MIN_HANDS          # đủ số tay tối thiểu để được vào bàn
+
+    def test_ladder_default_is_eight_doubling_rungs(self):
+        self.assertEqual(ME.DEFAULT_LADDER, [20, 40, 80, 160, 320, 640, 1280, 2560])
+        self.assertEqual(sum(ME.DEFAULT_LADDER), 5100)
+        self.assertEqual(ME.ladder_stakes(None), [float(v) for v in ME.DEFAULT_LADDER])
+
+    def test_multiply_builds_eight_rungs_from_the_first_step(self):
+        self.assertEqual(ME.multiply_ladder(50), [50, 100, 200, 400, 800, 1600, 3200, 6400])
+
+    def test_plan_starts_with_banker_at_the_first_rung(self):
+        plan = ME.plan(list(self.ROAD), ME.DEFAULT_LADDER)
+        self.assertEqual(plan["action"], "start")
+        self.assertEqual(plan["side"], E.BANKER)
+        self.assertEqual(plan["stake"], 20.0)
+
+    def test_plan_waits_when_the_road_is_too_short(self):
+        plan = ME.plan(["B"] * (ME.MIN_HANDS - 1), ME.DEFAULT_LADDER)
+        self.assertEqual(plan["action"], "wait")
+        self.assertAlmostEqual(plan["stake"], 0.0)
+
+    def test_plan_halts_after_the_last_rung(self):
+        plan = ME.plan(list(self.ROAD), ME.DEFAULT_LADDER, ladder_step=8, started=True)
+        self.assertEqual(plan["action"], "halt")
+        self.assertIn("8 bậc", plan["reason"])
+
+    def test_win_resets_the_ladder_and_flips_the_side(self):
+        state = {"started": True, "ladder_step": 3, "side": E.BANKER}
+        new, settled = ME.advance(state, E.BANKER, E.BANKER, 160)
+        self.assertEqual(settled["outcome"], "win")
+        self.assertEqual(new["ladder_step"], 0)
+        self.assertEqual(new["side"], E.PLAYER)
+
+    def test_loss_goes_to_the_next_rung_and_flips_the_side(self):
+        state = {"started": True, "ladder_step": 0, "side": E.BANKER}
+        new, settled = ME.advance(state, E.PLAYER, E.BANKER, 20)
+        self.assertEqual(settled["outcome"], "loss")
+        self.assertEqual(new["ladder_step"], 1)
+        self.assertEqual(new["side"], E.PLAYER)
+
+    def test_tie_is_a_push_and_changes_nothing(self):
+        state = {"started": True, "ladder_step": 2, "side": E.PLAYER}
+        new, settled = ME.advance(state, E.TIE, E.PLAYER, 80)
+        self.assertEqual(settled["outcome"], "push")
+        self.assertAlmostEqual(settled["delta"], 0.0)
+        self.assertEqual(new, state)
+
+    def test_check_table_only_looks_at_the_hand_count(self):
+        short = ME.check_table(list("B" * (ME.MIN_HANDS - 1)))
+        self.assertFalse(short["eligible"])
+        self.assertEqual(len(short["checks"]), 1)
+
+        good = ME.check_table(list(self.ROAD))
+        self.assertTrue(good["eligible"])
+        self.assertNotIn("strong", good)
+
+        long_road = ME.check_table(list("B" * (ME.MAX_HANDS + 1)))
+        self.assertFalse(long_road["eligible"])
+
+    def test_road_alternation_does_not_depend_on_the_actual_road(self):
+        """Cầu thực tế (bệt hay xen kẽ) không đổi cửa của tay kế tiếp."""
+        bet = {"started": True, "ladder_step": 0, "side": E.BANKER}
+        for road in ("BBBBBB", "PPPPPP", "BPBPBP", "BPBPPB"):
+            plan = ME.plan(list(road) + list(self.ROAD), ME.DEFAULT_LADDER, 0,
+                           bet["side"], True)
+            self.assertEqual(plan["side"], bet["side"], road)
 
 
 class DispatchTests(unittest.TestCase):
@@ -104,10 +140,12 @@ class DispatchTests(unittest.TestCase):
         result, error = engine.dispatch(service, "ping", {})
         self.assertIsNone(error)
         self.assertTrue(result["pong"])
+
         snapshot, error = engine.dispatch(service, "state", {})
         self.assertIsNone(error)
-        self.assertEqual(snapshot["game"], "longlong")
-        self.assertEqual(snapshot["ladder"], longlong.DEFAULT_LADDER)
+        self.assertEqual(snapshot["game"], "baccarat")
+        self.assertEqual(snapshot["table"]["ladder"], [float(v) for v in ME.DEFAULT_LADDER])
+        self.assertEqual(snapshot["table"]["method"], ME.METHOD_NAME)
         self.assertFalse(snapshot["tool_running"])
 
     def test_unknown_method_reports_an_error(self):
@@ -116,475 +154,149 @@ class DispatchTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIn("không hỗ trợ", error)
 
-    def test_both_games_have_their_own_service(self):
+    def test_build_service_only_knows_baccarat(self):
         emit = FakeEmitter()
-        baccarat = engine.build_service("baccarat", emit, pathlib.Path(tempfile.mkdtemp()) / "b.json")
-        longlong_service = engine.build_service("longlong", emit, pathlib.Path(tempfile.mkdtemp()) / "l.json")
-        self.assertIsInstance(baccarat, engine.BaccaratService)
-        self.assertIsInstance(longlong_service, engine.LongLongService)
-        self.assertIsNot(type(baccarat), type(longlong_service))
-
-
-class TickTests(unittest.TestCase):
-    def test_one_hand_per_round_even_if_winner_repeats(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0),
-                           state("JNS_C", "VD", at=1001.0),
-                           state("JNS_C", "VD", at=1002.0)])
-        service = make_service(table=table)
-        for _ in range(3):
-            service.tick()
-        self.assertEqual(service.tracker.hands, 1)
-        self.assertEqual(service.sim.strategy.results, ["VD"])
-
-    def test_new_winner_counts_as_a_new_hand(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0),
-                           state("JNS_A", "DD", at=1010.0)])
-        service = make_service(table=table, config={"confirm_reads": 1})
-        service.tick()
-        service.tick()
-        self.assertEqual(service.tracker.hands, 2)
-        self.assertEqual(service.sim.strategy.results, ["VD", "DD"])
-
-    def test_simulation_mode_arms_on_paper_and_never_places(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0)])
-        service = make_service(table=table, config={"place_real": False, "confirm_reads": 1})
-        service.tick()
-        self.assertEqual(table.places, [])
-        self.assertIsNotNone(service.sim.strategy.pending, "mô phỏng chốt trên giấy")
-
-    def test_real_mode_places_the_first_rung_and_only_then_arms(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
-        service.tick()
-        self.assertEqual(table.places, [10], "bậc 1 của bảng vốn mặc định là 10 đv")
-        self.assertIsNotNone(service.sim.strategy.pending, "chip vào rồi mới chốt sổ")
-
-    def test_low_balance_skips_placing_and_keeps_the_ladder(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=5.0)])
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
-        service.tick()
-        self.assertEqual(table.places, [])
-        self.assertIsNone(service.sim.strategy.pending,
-                          "không có tiền trên bàn thì không được chốt sổ")
-        self.assertEqual(service.sim.log, [])
-
-    def test_failed_placement_does_not_arm_the_plan(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
-        table.place_result = {"ok": False, "error": "Ván đã có kết quả"}
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
-        service.tick()
-        self.assertIsNone(service.sim.strategy.pending, "đặt hỏng thì không được tính là đã cược")
-
-
-class HandTieTests(unittest.TestCase):
-    """Lệnh phải thuộc ĐÚNG ván: đặt trễ thì bỏ, không cộng/trừ tiền cho tay chưa mở."""
-
-    def test_bet_armed_for_the_next_hand(self):
-        service = make_service()
-        service.manual_hand({"result": "VD"})
-        self.assertEqual(service.sim.strategy.pending["hand"], 2)
-
-    def test_matching_hand_is_settled(self):
-        service = make_service()
-        service.manual_hand({"result": "VD"})      # chốt lệnh cho ván 2
-        service.manual_hand({"result": "VD"})      # ván 2 khớp -> thắng
-        self.assertEqual(len(service.sim.log), 1)
-        self.assertTrue(service.sim.log[0]["won"])
-
-    def test_hand_from_another_round_drops_the_bet(self):
-        service = make_service()
-        service.manual_hand({"result": "VD"})      # lệnh cho ván 2
-        service._on_hand("VD", hand=3)             # nhưng ván 3 mới ra kết quả
-        self.assertEqual(service.sim.log, [], "không được ghi tiền cho tay này")
-        texts = [entry["text"] for entry in service.logs]
-        self.assertTrue(any("BỎ lệnh" in text for text in texts), texts)
-
-    def test_manual_hands_keep_numbering_consistent(self):
-        service = make_service()
-        service.manual_hand({"result": "VD"})
-        service.manual_hand({"result": "VV"})
-        self.assertEqual(service.tracker.hands, 2)
-        self.assertEqual(len(service.sim.log), 1)   # ván 2 khớp lệnh -> có tính tiền
-
-
-class UnitModePlacementTests(unittest.TestCase):
-    """Sàn in tiền thật (khay 10.000 …): bậc 10 đv phải gửi 10.000, không phải 10."""
-
-    def test_vn2_mode_sends_the_ladder_number_as_is(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
-                                                    "ladder": [40, 80], "unit_mode": "vn2"})
-        service.tick()
-        self.assertEqual(table.places, [40])
-
-    def test_vnd_mode_sends_ten_thousand_for_a_ten_unit_rung(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500000.0)])
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
-                                                    "ladder": [10, 20], "unit_mode": "vnd"})
-        service.tick()
-        self.assertEqual(table.places, [10000])
-        self.assertTrue(table.place_result["ok"])
-
-    def test_balance_is_compared_in_ladder_units(self):
-        # Số dư 50.000 (VND) = 50 đv: đủ cho bậc 10 nhưng không đủ cho bậc 80.
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=50000.0)])
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
-                                                    "ladder": [10, 20], "unit_mode": "vnd"})
-        service.tick()
-        self.assertEqual(table.places, [10000])
-        low = FakeTable([state("JNS_C", "VD", at=1000.0, balance=5000.0)])
-        service = make_service(table=low, config={"place_real": True, "confirm_reads": 1,
-                                                  "ladder": [10, 20], "unit_mode": "vnd"})
-        service.tick()
-        self.assertEqual(low.places, [], "5.000đ không đủ cho bậc 10 đv (10.000đ)")
-
-    def test_big_chips_trigger_a_hint_to_change_the_unit_mode(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500000.0)])
-        table.place_result = {"ok": False, "error": "Không chia được 40 theo mệnh giá",
-                              "denominations": [10000, 20000, 40000, 100000]}
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
-                                                    "unit_mode": "vn2"})
-        service.tick()
-        texts = [entry["text"] for entry in service.logs]
-        self.assertTrue(any("Đơn vị tiền trên sàn" in text for text in texts), texts)
-
-    def test_snapshot_exposes_mode_and_scale_for_the_ui(self):
-        service = make_service(config={"unit_mode": "vnd"})
-        snapshot = service.snapshot()
-        self.assertEqual(snapshot["unit_mode"], "vnd")
-        self.assertEqual(snapshot["site_scale"], 1.0)
-        self.assertEqual(snapshot["config"]["unit_mode"], "vnd")
-
-    def test_config_set_persists_the_mode(self):
-        service = make_service()
-        reply = service.config_set({"unit_mode": "vnd"})
-        self.assertTrue(reply["ok"])
-        saved = json.loads(service.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["unit_mode"], "vnd")
-        self.assertEqual(service.unit_mode, "vnd")
-
-
-class PaceTests(unittest.TestCase):
-    """Nhịp đọc và chống spam nhật ký khi cửa sổ cược chưa mở."""
-
-    def test_polls_faster_while_waiting_to_place(self):
-        service = make_service(config={"place_real": True})
-        service.interval = 2.0
-        self.assertEqual(service._next_wait(), 2.0)
-        service._on_hand("VD", hand=1)          # có kế hoạch đặt -> đọc nhanh hơn
-        self.assertLess(service._next_wait(), 2.0)
-
-    def test_place_failures_are_logged_once_per_hand(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
-        table.place_result = {"ok": False, "error": "Ván đã có kết quả; chờ ván mới."}
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
-        for _ in range(4):
-            service.tick()
-        fails = [entry for entry in service.logs if "Đặt chip chưa được" in entry["text"]]
-        self.assertEqual(len(fails), 1, [entry["text"] for entry in service.logs])
-
-    def test_does_not_hot_poll_when_the_balance_is_too_low(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=5.0)])
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
-        service.interval = 2.0
-        service.tick()
-        self.assertEqual(service._next_wait(), 2.0, "thiếu tiền thì đọc nhanh cũng vô ích")
-
-    def test_a_new_hand_clears_the_failure_marker(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0),
-                           state("JNS_C", "VD", at=1030.0, balance=500.0)])
-        table.place_result = {"ok": False, "error": "Ván đã có kết quả; chờ ván mới."}
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1})
-        service.tick()
-        service.tick()
-        fails = [entry for entry in service.logs if "Đặt chip chưa được" in entry["text"]]
-        self.assertEqual(len(fails), 2, [entry["text"] for entry in service.logs])
-
-
-class ChipWatchTests(unittest.TestCase):
-    """Chip bị sàn huỷ/hoàn tiền trước khi có kết quả -> không được tính tiền."""
-
-    def test_chip_that_disappears_voids_the_bet(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
-                                                    "chip_watch_seconds": 0.0})
-        service.tick()
-        self.assertIsNotNone(service.sim.strategy.pending)
-        self.assertEqual(service.sim.strategy.pending["amount_site"], 10)
-        service._watch_chips({"total_bet_vn2": 0.0})
-        service._watch_chips({"total_bet_vn2": 0.0})
-        self.assertIsNone(service.sim.strategy.pending, "chip biến mất thì phải bỏ lệnh")
-        self.assertEqual(service.sim.log, [], "bỏ lệnh thì không ghi tiền")
-        texts = [entry["text"] for entry in service.logs]
-        self.assertTrue(any("biến mất" in text for text in texts), texts)
-
-    def test_chip_still_on_the_table_keeps_the_bet(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
-                                                    "chip_watch_seconds": 0.0})
-        service.tick()
-        service._watch_chips({"total_bet_vn2": 10.0})
-        self.assertIsNotNone(service.sim.strategy.pending, "còn tiền trên bàn thì giữ lệnh")
-
-    def test_short_gap_does_not_void(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
-        service = make_service(table=table, config={"place_real": True, "confirm_reads": 1,
-                                                    "chip_watch_seconds": 30.0})
-        service.tick()
-        service._watch_chips({"total_bet_vn2": 0.0})
-        service._watch_chips({"total_bet_vn2": 0.0})
-        self.assertIsNotNone(service.sim.strategy.pending, "chưa đủ thời gian chờ thì chưa bỏ")
-
-
-class WebSocketGateTests(unittest.TestCase):
-    """Luồng WebSocket của sàn: biết đúng cửa sổ cược và đúng ván để tất toán."""
-
-    OPEN = {"ok": True, "phase": "BetsOpen", "round": "r1", "remaining_ms": 12000}
-    CLOSED = {"ok": True, "phase": "BetsClosed", "round": "r1", "remaining_ms": 0}
-
-    @staticmethod
-    def prime(service, raw="VD"):
-        """Nạp sẵn một ván để chiến thuật có kế hoạch đặt ở ván kế tiếp."""
-        service.tracker.hands += 1
-        service._on_hand(raw, hand=service.tracker.hands, round_id="r0")
-
-    def test_places_only_while_the_site_says_bets_are_open(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
-        service = make_service(table=table, stream=FakeStream(self.OPEN),
-                               config={"place_real": True, "confirm_reads": 1})
-        self.prime(service)
-        service.tick()
-        self.assertEqual(table.places, [10])
-        self.assertEqual(service.sim.strategy.pending["round"], "r1")
-
-    def test_does_not_click_when_the_window_is_closed(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
-        service = make_service(table=table, stream=FakeStream(self.CLOSED),
-                               config={"place_real": True, "confirm_reads": 1})
-        self.prime(service)
-        service.tick()
-        self.assertEqual(table.places, [], "sàn báo đóng cược thì không bấm")
-        texts = [entry["text"] for entry in service.logs]
-        self.assertTrue(any("chưa mở cược" in text for text in texts), texts)
-
-    def test_refuses_when_the_window_is_about_to_close(self):
-        table = FakeTable([state("JNS_C", "VD", at=1000.0, balance=500.0)])
-        soon = dict(self.OPEN, remaining_ms=800)
-        service = make_service(table=table, stream=FakeStream(soon),
-                               config={"place_real": True, "confirm_reads": 1,
-                                       "min_bet_ms": 3000})
-        self.prime(service)
-        service.tick()
-        self.assertEqual(table.places, [], "còn 800ms là đóng thì bỏ ván")
-        texts = [entry["text"] for entry in service.logs]
-        self.assertTrue(any("đóng cược" in text for text in texts), texts)
-
-    def test_result_of_the_same_round_settles_the_bet(self):
-        resolved = {"ok": True, "phase": "GameResolved", "round": "r1",
-                    "result": "VD", "result_round": "r1", "remaining_ms": None}
-        service = make_service(stream=FakeStream(resolved))
-        self.prime(service)                      # có lệnh chờ cho ván kế tiếp
-        service.sim.strategy.arm(hand=2)
-        service.sim.strategy.pending.update({"round": "r1", "amount_site": 40})
-        service.tick()
-        self.assertEqual(len(service.sim.log), 1)
-        self.assertTrue(service.sim.log[0]["won"], "vàng-đỏ và đặt ô C -> thắng")
-
-    def test_result_of_another_round_drops_the_bet(self):
-        resolved = {"ok": True, "phase": "GameResolved", "round": "r9",
-                    "result": "VD", "result_round": "r9", "remaining_ms": None}
-        service = make_service(stream=FakeStream(resolved))
-        self.prime(service)
-        service.sim.strategy.arm(hand=2)
-        service.sim.strategy.pending.update({"round": "r1", "amount_site": 40})
-        service.tick()
-        self.assertEqual(service.sim.log, [], "kết quả ván khác thì không tính tiền")
-        texts = [entry["text"] for entry in service.logs]
-        self.assertTrue(any("BỎ lệnh" in text for text in texts), texts)
-
-    def test_the_same_round_is_settled_only_once(self):
-        resolved = {"ok": True, "phase": "GameResolved", "round": "r1",
-                    "result": "DD", "result_round": "r1", "remaining_ms": None}
-        service = make_service(stream=FakeStream(resolved))
-        service.tick()
-        service.tick()
-        service.tick()
-        self.assertEqual(service.tracker.hands, 1, "một ván chỉ chốt một lần")
-
-
-class TakeProfitTests(unittest.TestCase):
-    """Lãi mục tiêu %: chốt vốn đầu phiên, đạt ngưỡng thì tự dừng tool."""
-
-    @staticmethod
-    def prepare(service, units=3000.0, pct=30.0, source="balance"):
-        service.config["take_profit_pct"] = pct
-        service.session_start = {"units": units, "at": 0.0, "source": source}
-
-    def test_stops_when_profit_reaches_the_target(self):
-        service = make_service(states=[state(balance=3900.0)])
-        self.prepare(service)
-        service.tick()
-        self.assertTrue(service.take_profit_hit)
-        self.assertTrue(service._stop.is_set(), "phải dừng vòng đặt chip")
-        texts = [entry["text"] for entry in service.logs]
-        self.assertTrue(any("DỪNG TOOL" in text for text in texts), texts)
-
-    def test_does_not_stop_below_the_target(self):
-        service = make_service(states=[state(balance=3899.0)])
-        self.prepare(service)
-        service.tick()
-        self.assertFalse(service.take_profit_hit)
-
-    def test_is_off_when_the_percentage_is_zero(self):
-        service = make_service(states=[state(balance=99999.0)])
-        self.prepare(service, pct=0.0)
-        service.tick()
-        self.assertFalse(service.take_profit_hit, "0% = tắt, không được tự dừng")
-
-    def test_baseline_uses_the_site_balance_when_available(self):
-        service = make_service()
-        start = service._capture_baseline(state={"balance_vn2": 3000.0})
-        self.assertEqual(start["units"], 3000.0)
-        self.assertEqual(start["source"], "balance")
-
-    def test_baseline_falls_back_to_the_configured_capital(self):
-        service = make_service()
-        service.config["capital"] = 2500
-        start = service._capture_baseline(state={"ok": False})
-        self.assertEqual(start["units"], 2500.0)
-        self.assertEqual(start["source"], "config")
-
-    def test_baseline_is_recaptured_from_the_site_when_it_was_only_config(self):
-        service = make_service(states=[state(balance=3000.0)])
-        self.prepare(service, units=10000.0, source="config")
-        service.tick()
-        self.assertEqual(service.session_start["source"], "balance")
-        self.assertEqual(service.session_start["units"], 3000.0)
-        self.assertFalse(service.take_profit_hit, "vốn thật 3000 chưa đạt 3900")
-
-    def test_reset_clears_the_baseline(self):
-        service = make_service()
-        self.prepare(service)
-        service.session_reset()
-        self.assertIsNone(service.session_start)
-        self.assertFalse(service.take_profit_hit)
-
-    def test_snapshot_exposes_the_target(self):
-        service = make_service(states=[state(balance=3300.0)])
-        self.prepare(service)
-        service.tick()
-        tp = service.snapshot()["take_profit"]
-        self.assertTrue(tp["enabled"])
-        self.assertEqual(tp["pct"], 30.0)
-        self.assertEqual(tp["start_units"], 3000.0)
-        self.assertEqual(tp["target_units"], 3900.0)
-        self.assertAlmostEqual(tp["progress_pct"], 10.0, places=6)
-        self.assertFalse(tp["hit"])
+        service = engine.build_service("baccarat", emit,
+                                      pathlib.Path(tempfile.mkdtemp()) / "b.json")
+        try:
+            self.assertIsInstance(service, engine.BaccaratService)
+        finally:
+            service.shutdown()
+        with self.assertRaises(SystemExit):
+            engine.build_service("longlong", emit, pathlib.Path(tempfile.mkdtemp()) / "l.json")
 
 
 class ConfigTests(unittest.TestCase):
-    def test_config_set_persists_and_updates_the_ladder(self):
+    def test_defaults_expose_the_eight_rung_ladder(self):
         service = make_service()
-        service.config_set({"ladder": [20, 40, 80], "place_real": True, "min_gap": 20})
+        config = service.config
+        self.assertEqual([float(v) for v in config["ladder"]],
+                         [float(v) for v in ME.DEFAULT_LADDER])
+        self.assertEqual(config["ladder_mode"], "manual")
+        self.assertEqual((config["min_hands"], config["max_hands"]),
+                         (ME.MIN_HANDS, ME.MAX_HANDS))
+        self.assertNotIn("profile", config)
+        self.assertNotIn("block_mode", config)
+
+    def test_config_set_saves_a_manual_ladder(self):
+        service = make_service()
+        reply = service.config_set({"ladder": [20, 40, 80]})
+        self.assertTrue(reply["ok"], reply)
         saved = json.loads(service.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["ladder"], [20, 40, 80])
-        self.assertTrue(saved["place_real"])
-        self.assertEqual(saved["min_gap"], 20)
-        self.assertEqual(service.sim.strategy.ladder, [20, 40, 80])
-        self.assertEqual(service.tracker.min_gap, 20)
+        self.assertEqual(saved["settings"]["ladder"], [20, 40, 80])
+        self.assertEqual(service.sim.ladder, [20.0, 40.0, 80.0])
 
-    def test_ladder_from_capital_matches_the_board(self):
-        service = make_service()
-        snapshot = service.ladder_from_capital({"capital": 5110, "base": 10, "mult": 2})
-        self.assertEqual(snapshot["ladder"], [10, 20, 40, 80, 160, 320, 640, 1280, 2560])
-        self.assertEqual(sum(snapshot["ladder"]), 5110, "9 tay, đúng bảng vốn mặc định")
-        self.assertEqual(snapshot["config"]["ladder_mult"], 2.0)
+    def test_multiply_mode_regenerates_the_ladder_from_the_first_rung(self):
+        service = make_service({"ladder_mode": "multiply", "ladder_base": 50})
+        self.assertEqual(service.config["ladder"], [50, 100, 200, 400, 800, 1600, 3200, 6400])
 
-    def test_ladder_from_capital_with_mult_two_keeps_room(self):
-        service = make_service()
-        snapshot = service.ladder_from_capital({"capital": 10000, "base": 10, "mult": 2})
-        self.assertEqual(snapshot["ladder"], [10, 20, 40, 80, 160, 320, 640, 1280, 2560])
-        self.assertLessEqual(sum(snapshot["ladder"]), 10000)
+    def test_fixed_mode_uses_the_same_stake_for_every_hand(self):
+        service = make_service({"ladder_mode": "fixed", "flat_stake": 30})
+        self.assertEqual(service.config["ladder"], [30.0] * len(ME.DEFAULT_LADDER))
+        self.assertEqual(service.sim.fixed_stake, 30.0)
 
-    def test_ladder_set_saves_hand_edited_stakes_and_capital(self):
+    def test_config_set_rejects_a_bad_ladder(self):
         service = make_service()
-        reply = service.ladder_set({"ladder": [20, 40, 80]})
-        self.assertTrue(reply["ok"])
-        saved = json.loads(service.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["ladder"], [20, 40, 80])
-        self.assertEqual(saved["capital"], 140, "vốn phiên = tổng các tay vừa lưu")
-        self.assertEqual(service.sim.strategy.ladder, [20, 40, 80])
-
-    def test_ladder_set_defaults_restores_the_board(self):
-        service = make_service()
-        service.ladder_set({"ladder": [20, 40, 80]})
-        reply = service.ladder_set({"defaults": True})
-        self.assertTrue(reply["ok"])
-        self.assertEqual(reply["ladder"], longlong.DEFAULT_LADDER)
-        self.assertEqual(reply["config"]["capital"], 5110)
-        self.assertEqual(reply["config"]["base"], longlong.DEFAULT_BASE)
-
-    def test_ladder_set_rejects_an_empty_board(self):
-        service = make_service()
-        reply = service.ladder_set({"ladder": []})
+        reply = service.config_set({"ladder": [0, 10]})
         self.assertFalse(reply["ok"])
-        self.assertIn("Chưa có tay", reply["error"])
+        self.assertIn("lớn hơn 0", reply["error"])
 
-    def test_session_reset_clears_strategy_and_tracker(self):
+    def test_hand_range_and_exit_streak_are_clamped(self):
         service = make_service()
-        service.tick()
-        service.session_reset()
-        self.assertEqual(service.sim.strategy.results, [])
-        self.assertEqual(service.tracker.hands, 0)
+        service.config_set({"min_hands": 1, "max_hands": 999, "live_exit_streak": 99})
+        self.assertEqual(service.config["min_hands"], ME.HANDS_LOWER)
+        self.assertEqual(service.config["max_hands"], ME.HANDS_UPPER)
+        self.assertEqual(service.config["live_exit_streak"], ME.STREAK_UPPER)
 
-    def test_manual_hand_rejects_bad_input(self):
+    def test_session_new_keeps_the_ladder_settings(self):
+        service = make_service({"ladder_mode": "multiply", "ladder_base": 40,
+                                "min_hands": 12, "max_hands": 24})
+        self.assertTrue(service.session_new({"capital": 4000})["ok"])
+        self.assertEqual(service.sim.ladder, [40, 80, 160, 320, 640, 1280, 2560, 5120])
+        self.assertEqual((service.sim.min_hands, service.sim.max_hands), (12, 24))
+        self.assertAlmostEqual(service.sim.money.start_capital, 4000.0)
+
+    def test_session_reset_returns_to_the_first_rung(self):
         service = make_service()
-        self.assertFalse(service.manual_hand({"result": "x"})["ok"])
-        self.assertTrue(service.manual_hand({"result": "VD"})["ok"])
-        self.assertEqual(service.sim.strategy.results, ["VD"])
+        with_outcome = service.sim.method_state
+        with_outcome["started"] = True
+        with_outcome["ladder_step"] = 4
+        self.assertTrue(service.session_reset()["ok"])
+        self.assertFalse(service.sim.method_state["started"])
+        self.assertEqual(service.sim.method_state["ladder_step"], 0)
+        self.assertEqual(service.sim.results, [])
+
+    def test_state_file_with_old_profile_keys_is_tolerated(self):
+        folder = pathlib.Path(tempfile.mkdtemp())
+        path = folder / "state.json"
+        path.write_text(json.dumps({
+            "format": "live-v2-engine",
+            "settings": {"profile": "3-3", "block_mode": "repeat", "max_streak": 3,
+                         "min_lead": 3, "max_lead": 5, "tie_side": "B",
+                         "ladder": [10, 20, 40, 80, 160, 320], "start_url": "ftp://x"},
+        }), encoding="utf-8")
+        service = engine.BaccaratService(path, FakeEmitter())
+        self.assertNotIn("profile", service.config)
+        self.assertTrue(service.config["start_url"].startswith("http"))
+        self.assertEqual(service.config["ladder"], [10.0, 20.0, 40.0, 80.0, 160.0, 320.0])
 
 
-class ToolLifecycleTests(unittest.TestCase):
-    def test_tool_refuses_to_start_without_chrome(self):
-        service = make_service()
-        service.browser = type("FakeBrowser", (), {"connected": False})()
-        result = service.tool_start()
-        self.assertFalse(result["ok"])
-        self.assertIn("Chưa mở Chrome", result["error"])
+class TableRowTests(unittest.TestCase):
+    def service(self, letters, config=None):
+        service = make_service(config)
+        service.browser = fake_browser()
+        table_row(service, letters)
+        return service
+
+    def test_a_table_with_enough_hands_is_eligible(self):
+        row = self.service("B" * 20).table_rows()[0]
+        self.assertTrue(row["eligible"], row["verdict"])
+        self.assertEqual(row["hands"], 20)
+        self.assertNotIn("strong", row)
+        self.assertNotIn("lead", row)
+        self.assertNotIn("tie_side", row)
+        self.assertEqual(len(row["checks"]), 1)
+
+    def test_a_table_outside_the_hand_range_is_rejected(self):
+        short = self.service("B" * (ME.MIN_HANDS - 1)).table_rows()[0]
+        self.assertFalse(short["eligible"])
+        self.assertIn("ván này đã đi", short["verdict"])
+
+    def test_the_hand_range_can_be_widened(self):
+        service = self.service("B" * 40, {"min_hands": 10, "max_hands": 20})
+        row = service.table_rows()[0]
+        self.assertFalse(row["eligible"], "40 tay vượt max 20")
+        service.config_set({"min_hands": 30, "max_hands": 50})
+        self.assertTrue(service.table_rows()[0]["eligible"])
+
+    def test_heavy_streaks_do_not_disqualify_a_table(self):
+        """Phương pháp 1-1 không xét bệt, nên bệt 8 tay vẫn đạt điều kiện vào bàn."""
+        row = self.service("B" * 8 + "P" * 8 + "B" * 8).table_rows()[0]
+        self.assertTrue(row["eligible"], row["verdict"])
+
+    def test_no_tables_are_listed_without_chrome(self):
+        service = self.service("B" * 20)
+        service.browser = fake_browser(connected=False, note="Chrome đã đóng")
+        self.assertEqual(service.snapshot()["tables"], [])
 
 
-class BaccaratEnterValidTests(unittest.TestCase):
+class EnterValidTests(unittest.TestCase):
     """Nút duy nhất “VÀO BÀN HỢP LỆ”: tìm + mở + xác nhận nhưng KHÔNG cược."""
 
-    # 22 tay: B 13 · P 9 (lệch 4), không bệt quá 3, không có cầu 3-3 → đạt cả 5 điều kiện.
-    VALID = "".join(side * count for side, count in (
-        ("B", 3), ("P", 2), ("B", 3), ("P", 2), ("B", 2),
-        ("P", 3), ("B", 2), ("P", 2), ("B", 3)))
+    VALID = "B" * 22
 
-    def service(self, letters=None, config=None):
-        letters = self.VALID if letters is None else letters
-        emit = FakeEmitter()
-        service = engine.BaccaratService(pathlib.Path(tempfile.mkdtemp()) / "b.json", emit)
-        if config:
-            self.assertTrue(service.config_set(config)["ok"])
-        service.browser = type("FakeBrowser", (), {
-            "connected": True, "note": "", "mode": "cdp", "stop": lambda self: None,
-        })()
-        now = time.time()
-        service.tables = {"id:x": {
-            "key": "id:x", "label": "Bàn X", "letters": letters, "ts": now,
-            "table_id": "x", "game_type": "", "read_error": "", "source": "evo-bead",
-            "conflict": False, "stable": 3, "screen_stable": 3,
-        }}
+    def service(self):
+        service = make_service({"min_hands": 10, "max_hands": 50})
+        service.browser = fake_browser()
+        table_row(service, self.VALID)
         return service
 
     def prime(self, service, letters=None):
-        """Giả lập: đã bấm ô bàn và cầu trong bàn đã xác nhận cùng shoe."""
-        letters = service.tables["id:x"]["letters"] if letters is None else letters
         service.enter_valid = True
         service.valid_check_done = False
-        service.auto_start_key = "id:x"
-        service.auto_start_letters = letters
+        service.auto_start_key = "id:t1"
+        service.auto_start_letters = (service.tables["id:t1"]["letters"]
+                                      if letters is None else letters)
         service.auto_start_deadline = time.time() + 60
 
     def test_enter_valid_binds_the_table_without_starting_a_session(self):
@@ -593,7 +305,7 @@ class BaccaratEnterValidTests(unittest.TestCase):
         service._auto_start_verified_table()
         self.assertTrue(service.valid_check_done)
         self.assertFalse(service.enter_valid)
-        self.assertEqual(service.sim.table_key, "id:x")
+        self.assertEqual(service.sim.table_key, "id:t1")
         self.assertFalse(service.sim.running, "chưa bật tool thì chưa chạy phiên")
         self.assertIsNone(service.sim.pending, "chưa được arm kế hoạch cược")
         self.assertFalse(service.place_busy, "không được đặt chip")
@@ -605,7 +317,6 @@ class BaccaratEnterValidTests(unittest.TestCase):
         service._auto_start_verified_table()
         self.assertFalse(service.valid_check_done)
         self.assertIsNone(service.auto_start_key, "phải bỏ bàn khác shoe")
-        self.assertFalse(service.sim.running)
 
     def test_tool_start_arms_the_verified_table(self):
         service = self.service()
@@ -623,7 +334,7 @@ class BaccaratEnterValidTests(unittest.TestCase):
         called = []
         service.open_table = lambda key: called.append(key) or {"ok": True}
         service.auto_open_table(allow_sweep=False)
-        self.assertEqual(called, ["id:x"], "phải mở bàn đạt chuẩn dù tool chưa chạy")
+        self.assertEqual(called, ["id:t1"], "phải mở bàn đạt chuẩn dù tool chưa chạy")
 
     def test_auto_hunt_alone_still_needs_the_tool(self):
         service = self.service()
@@ -660,7 +371,7 @@ class BaccaratEnterValidTests(unittest.TestCase):
         self.assertFalse(block["checked"])
         self.assertGreater(block["remain"], 0)
 
-    def test_baccarat_tool_start_without_chrome_enters_valid_flow(self):
+    def test_tool_start_without_chrome_enters_valid_flow(self):
         service = self.service()
         service.browser = type("FakeBrowser", (), {
             "connected": False, "note": "", "mode": "cdp", "cdp_attached": False,
@@ -673,249 +384,101 @@ class BaccaratEnterValidTests(unittest.TestCase):
         service.cancel_enter_valid()
 
 
-class BaccaratEngineTests(unittest.TestCase):
+class ScanTests(unittest.TestCase):
     def test_scan_maps_browser_reports_to_rows(self):
-        emit = FakeEmitter()
-        service = engine.BaccaratService(pathlib.Path(tempfile.mkdtemp()) / "b.json", emit)
+        service = make_service()
         service.browser = type("FakeBrowser", (), {
             "connected": True,
-            "scan": lambda self: [{"tables": [{"id": "t1", "title": "Bàn 1", "letters": "BBBPPP"}]}],
+            "scan": lambda self: [{"tables": [{"id": "t1", "title": "Bàn 1",
+                                               "letters": "BBBPPP"}]}],
         })()
         snapshot = service.scan()
         self.assertEqual(snapshot["tables"][0]["id"], "t1")
         self.assertEqual(snapshot["tables"][0]["letters"], "BBBPPP")
 
 
-class BaccaratTableFilterTests(unittest.TestCase):
-    """Lọc bàn Baccarat: hoà điểm ưu tiên bên đỏ, chặn lệch B/P quá lớn (4-5 tay)."""
-
-    @staticmethod
-    def road(*runs):
-        """Ghép cầu từ các vệt (ký tự, số tay) để dễ kiểm soát số B/P và bệt."""
-        return "".join(side * count for side, count in runs)
-
-    # B 13 · P 9 (lệch 4), không bệt quá 3 tay, không có hai vệt 3 liền nhau.
-    LEAD4 = road(("B", 3), ("P", 2), ("B", 3), ("P", 2), ("B", 2), ("P", 3),
-                 ("B", 2), ("P", 2), ("B", 3))
-    # B 20 · P 10 (lệch 10) — vượt mức tối đa mặc định.
-    LEAD10 = road(("B", 3), ("P", 2), ("B", 2), ("P", 1), ("B", 3), ("P", 2),
-                  ("B", 2), ("P", 1), ("B", 3), ("P", 2), ("B", 2), ("P", 1),
-                  ("B", 3), ("P", 1), ("B", 2))
-    # Hoà điểm B 8 · P 8, vệt cuối là Player.
-    TIE = road(("B", 2), ("P", 3), ("B", 2), ("P", 2), ("B", 2), ("P", 2),
-               ("B", 2), ("P", 1))
-
-    def service(self, letters, config=None):
-        emit = FakeEmitter()
-        service = engine.BaccaratService(pathlib.Path(tempfile.mkdtemp()) / "b.json", emit)
-        if config:
-            result = service.config_set(config)
-            self.assertTrue(result["ok"], result)
-        # table_rows chỉ trả bàn khi còn Chrome: giả lập một phiên đang kết nối.
-        service.browser = type("FakeBrowser", (), {"connected": True, "note": "",
-                                                   "mode": "cdp", "stop": lambda self: None})()
-        now = __import__("time").time()
-        service.tables = {"id:t1": {
-            "key": "id:t1", "label": "Bàn 1", "letters": letters, "ts": now,
-            "table_id": "t1", "game_type": "", "read_error": "", "source": "evo-ws",
-            "conflict": False, "stable": 3, "ws_confirmed_letters": letters,
-        }}
-        return service
-
-    def test_default_window_accepts_a_four_hand_gap(self):
-        row = self.service(self.LEAD4).table_rows()[0]
-        self.assertEqual((row["banker"], row["player"], row["lead"]), (13, 9, 4))
-        self.assertTrue(row["eligible"], row["verdict"])
-        self.assertTrue(row["verdict"].startswith("Đạt 5/5"), row["verdict"])
-
-    def test_gap_bigger_than_max_lead_is_rejected(self):
-        row = self.service(self.LEAD10).table_rows()[0]
-        self.assertEqual((row["banker"], row["player"], row["lead"]), (20, 10, 10))
-        self.assertFalse(row["eligible"])
-        self.assertIn("chỉ nhận ≤ 5", row["verdict"])
-
-    def test_config_can_widen_or_drop_the_upper_bound(self):
-        wide = self.service(self.LEAD10, {"max_lead": 10}).table_rows()[0]
-        self.assertTrue(wide["eligible"], wide["verdict"])
-        unlimited = self.service(self.LEAD10, {"max_lead": None}).table_rows()[0]
-        self.assertTrue(unlimited["eligible"], unlimited["verdict"])
-        self.assertEqual(len(unlimited["checks"]), 4)   # không còn điều kiện trần
-
-    def test_tie_prefers_red_banker_by_default(self):
-        row = self.service(self.TIE).table_rows()[0]
-        self.assertEqual((row["banker"], row["player"], row["lead"]), (8, 8, 0))
-        self.assertTrue(row["tie_break"])
-        self.assertEqual(row["strong"], "B")
-        self.assertEqual(row["tie_side"], "B")
-        self.assertFalse(row["eligible"])            # lệch 0 vẫn dưới mức tối thiểu
-
-    def test_tie_can_follow_the_running_streak(self):
-        row = self.service(self.TIE, {"tie_side": "run"}).table_rows()[0]
-        self.assertEqual(row["strong"], "P")        # vệt cuối là Player
-        self.assertEqual(row["tie_side"], "run")
-
-    def test_new_session_keeps_the_lead_window(self):
-        service = self.service(self.LEAD4, {"max_lead": 4, "tie_side": "P"})
-        self.assertTrue(service.session_new({"capital": 2500})["ok"])
-        self.assertEqual((service.sim.min_lead, service.sim.max_lead), (3, 4))
-        self.assertEqual(service.sim.tie_side, "P")
-
-
-class LongLongChromeConfigTests(unittest.TestCase):
-    """Tab LONG-LONG cũng cấu hình Chrome như Baccarat: link mở đầu + cửa sổ."""
-
-    def service(self, path=None):
-        folder = pathlib.Path(tempfile.mkdtemp())
-        return engine.LongLongService(path or (folder / "state.json"), FakeEmitter())
-
-    def test_config_has_window_and_start_url_by_default(self):
-        service = self.service()
-        window = service.config["chrome_window"]
-        self.assertEqual(sorted(window), ["fullscreen", "height", "percent", "width"])
-        self.assertTrue(service.config["start_url"].startswith("http"))
-
-    def test_window_is_clamped_persisted_and_applied(self):
-        service = self.service()
-        reply = service.apply_window({"width": 99999, "height": 10, "percent": 500,
-                                      "fullscreen": True})
-        self.assertTrue(reply["ok"])
-        window = service.config["chrome_window"]
-        self.assertTrue(window["fullscreen"])
-        # Kẹp đúng biên của adapter (SIZE_MAX/SIZE_MIN), không nhận số vô lý.
-        self.assertEqual(window["width"], BR.SIZE_MAX[0])
-        self.assertEqual(window["height"], BR.SIZE_MIN[1])
-        self.assertEqual(window["percent"], BR.SCALE_MAX)
-        self.assertIn("toàn màn hình", reply["note"].lower())
-        saved = json.loads(service.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["chrome_window"], window)
-
-    def test_config_set_accepts_window_and_url_then_snapshot_exposes_them(self):
-        service = self.service()
-        reply = service.config_set({"chrome_window": {"width": 1600, "height": 900,
-                                                     "percent": 80, "fullscreen": False},
-                                    "start_url": "https://example.com/lobby"})
-        self.assertTrue(reply.get("ok"))
-        self.assertEqual(reply["config"]["chrome_window"]["width"], 1600)
-        self.assertEqual(reply["config"]["start_url"], "https://example.com/lobby")
-        vm = service.dispatch("chrome.window", {"width": 1280, "height": 720, "percent": 100})[0]
-        self.assertTrue(vm["ok"])
-
-    def test_invalid_start_url_is_rejected(self):
-        service = self.service()
-        reply = service.config_set({"start_url": "khong-phai-link"})
-        self.assertFalse(reply["ok"])
-        self.assertIn("không hợp lệ", reply["error"])
-
-    def test_state_file_with_bad_values_is_sanitized(self):
-        folder = pathlib.Path(tempfile.mkdtemp())
-        path = folder / "state.json"
-        path.write_text(json.dumps({"start_url": "ftp://x", "chrome_window": {"width": 0}}),
-                        encoding="utf-8")
-        service = self.service(path)
-        self.assertTrue(service.config["start_url"].startswith("http"))
-        self.assertGreaterEqual(service.config["chrome_window"]["width"], 400)
-
-
-class LongLongStatsWiringTests(unittest.TestCase):
-    """Tab Thống kê lấy số liệu từ sổ tay của controller (không tự tính ở UI)."""
-
-    def test_snapshot_carries_stats_block(self):
-        service = make_service()
-        stats = service.snapshot()["stats"]
-        for key in ("hands", "wins", "losses", "win_rate", "max_loss_streak",
-                    "current_loss_streak", "streak_histogram", "recent", "curve"):
-            self.assertIn(key, stats)
-
-    def test_manual_hands_are_settled_into_the_stats(self):
-        service = make_service()
-        # VD mở lệnh -> VV thua -> VD (chờ) -> VD thắng
-        for raw in ("VD", "VV", "VD", "VD"):
-            reply = service.manual_hand({"result": raw})
-            self.assertTrue(reply.get("ok"), reply)
-        stats = service.snapshot()["stats"]
-        self.assertEqual(stats["hands"], 2)
-        self.assertEqual((stats["wins"], stats["losses"]), (1, 1))
-        self.assertEqual(stats["max_loss_streak"], 1)
-        self.assertAlmostEqual(stats["net_units"], 9.0, places=6)  # -10 + 19 (bậc 2)
-        self.assertEqual(stats["recent"], ["L", "W"])
-
-
 class ChromeClosedRecoveryTests(unittest.TestCase):
     """Đóng Chrome bằng tay: app phải thấy mất kết nối và còn đường mở lại."""
 
-    @staticmethod
-    def fake_browser(connected=False, note=""):
-        return type("FakeBrowser", (), {"connected": connected, "note": note,
-                                        "mode": "cdp" if connected else "",
-                                        "stop": lambda self: None})()
-
     def baccarat(self):
-        emit = FakeEmitter()
-        service = engine.BaccaratService(pathlib.Path(tempfile.mkdtemp()) / "b.json", emit)
-        now = time.time()
-        service.tables = {"id:x": {"key": "id:x", "label": "Bàn X", "letters": "BBBP",
-                                   "ts": now, "table_id": "x", "game_type": "",
-                                   "read_error": "", "source": "evo-ws",
-                                   "conflict": False, "stable": 2}}
+        service = engine.BaccaratService(pathlib.Path(tempfile.mkdtemp()) / "b.json",
+                                        FakeEmitter())
+        table_row(service, "BBBP")
         service.tool_running = True
         return service
 
-    def longlong(self):
-        folder = pathlib.Path(tempfile.mkdtemp())
-        return engine.LongLongService(folder / "state.json", FakeEmitter())
-
-    def test_baccarat_clears_tables_and_pauses_when_chrome_closes(self):
+    def test_clears_tables_and_pauses_when_chrome_closes(self):
         service = self.baccarat()
-        service.browser = self.fake_browser(connected=True)
+        service.browser = fake_browser(connected=True)
         service._on_chrome_lost()
         self.assertEqual(service.tables, {})
         self.assertIn("Mở Chrome", service.sweep_note)
         self.assertTrue(service.offline_noted)
 
-    def test_baccarat_snapshot_reports_disconnected(self):
+    def test_snapshot_reports_disconnected(self):
         service = self.baccarat()
-        service.browser = self.fake_browser(connected=False, note="Chrome đã đóng")
+        service.browser = fake_browser(connected=False, note="Chrome đã đóng")
         snapshot = service.snapshot()
         self.assertFalse(snapshot["chrome_connected"])
         self.assertEqual(snapshot["tables"], [])
 
-    def test_baccarat_ready_flag_resets_after_reconnect(self):
+    def test_ready_flag_resets_after_reconnect(self):
         service = self.baccarat()
         service._on_chrome_lost()
         self.assertTrue(service.offline_noted)
         service._on_chrome_ready()
         self.assertFalse(service.offline_noted)
 
-    def test_longlong_hides_stale_numbers_when_chrome_closed(self):
-        service = self.longlong()
-        service.last_state = {"ok": True, "balance_vn2": 500.0, "read_at": 1.0}
-        service.browser = self.fake_browser(connected=False, note="Chrome đã đóng")
-        snapshot = service.snapshot()
-        self.assertFalse(snapshot["chrome_connected"])
-        self.assertIsNone(snapshot["balance_vn2"])
-        self.assertEqual(snapshot["chrome_note"], "Chrome đã đóng")
-
-    def test_longlong_reopens_chrome_after_being_closed(self):
-        service = self.longlong()
-        opened = []
-        service.browser = type("FakeBrowser", (), {
-            "connected": False, "note": "", "mode": "",
-            "start": lambda self, **kwargs: opened.append(kwargs) or True,
-            "resize_window": lambda self, *a, **k: (True, "ok"),
-            "stop": lambda self: None,
-        })()
-        reply = service.open_chrome()
-        self.assertTrue(reply["ok"])
-        time.sleep(0.4)                     # luồng mở Chrome chạy nền
-        self.assertTrue(opened, "phải gọi mở Chrome lại được")
-        self.assertEqual(opened[0]["url"], service.config["start_url"])
-
     def test_open_chrome_is_idempotent_while_alive(self):
-        service = self.longlong()
-        service.browser = self.fake_browser(connected=True)
-        reply = service.open_chrome()
+        service = self.baccarat()
+        service.browser = fake_browser(connected=True)
+        reply = service.chrome_open()
         self.assertTrue(reply["ok"])
         self.assertIn("đã kết nối", reply["note"])
+
+    def test_open_chrome_uses_the_configured_start_url(self):
+        service = self.baccarat()
+        opened = []
+        service.browser = type("FakeBrowser", (), {
+            "connected": False, "note": "", "mode": "", "last_diag": {},
+            "attach": lambda self: False,
+            "start": lambda self, **kwargs: opened.append(kwargs) or True,
+            "wait_for_cdp": lambda self: True,
+            "resize_window": lambda self, *a, **k: (True, "ok"),
+            "driver_info": "CDP 9222",
+            "stop": lambda self: None,
+        })()
+        reply = service.chrome_open()
+        self.assertTrue(reply["ok"])
+        time.sleep(0.4)                     # luồng mở Chrome chạy nền
+        self.assertTrue(opened, "phải gọi mở Chrome")
+        self.assertEqual(opened[0]["url"], service.config["start_url"])
+
+
+class WindowConfigTests(unittest.TestCase):
+    def test_config_has_window_and_start_url_by_default(self):
+        service = make_service()
+        window = service.config["chrome_window"]
+        self.assertEqual(sorted(window), ["fullscreen", "height", "percent", "width"])
+        self.assertTrue(service.config["start_url"].startswith("http"))
+
+    def test_window_is_clamped_persisted_and_applied(self):
+        service = make_service()
+        reply = service.apply_window({"width": 99999, "height": 10, "percent": 500,
+                                      "fullscreen": True})
+        self.assertTrue(reply["ok"])
+        window = service.config["chrome_window"]
+        self.assertTrue(window["fullscreen"])
+        self.assertEqual(window["width"], BR.SIZE_MAX[0])
+        self.assertEqual(window["height"], BR.SIZE_MIN[1])
+        self.assertEqual(window["percent"], BR.SCALE_MAX)
+        saved = json.loads(service.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["settings"]["chrome_window"], window)
+
+    def test_invalid_start_url_falls_back_to_the_site(self):
+        service = make_service()
+        service.config_set({"start_url": "khong-phai-link"})
+        self.assertEqual(service.config["start_url"], BR.START_URL)
 
 
 if __name__ == "__main__":

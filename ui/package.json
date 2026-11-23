@@ -2,7 +2,7 @@
   "name": "bcr-desktop",
   "version": "2.0.0",
   "private": true,
-  "description": "BCR Desktop — giao diện Electron cho tool Baccarat & LONG-LONG",
+  "description": "BCR Desktop - giao diện Electron cho tool Baccarat (1-1 xen kẽ B/P, gấp thếp 8 bậc)",
   "main": "main.js",
   "scripts": {
     "start": "electron .",

@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Tầng Service (transport): JSON-RPC qua stdin/stdout giữa Electron và Controller.
 
-Mỗi trò là một tiến trình riêng do Electron spawn, có profile Chrome, cổng CDP và
-file cấu hình/phiên riêng, nên thao tác ở tab này không ảnh hưởng tab kia.
+App chạy một tiến trình engine (Baccarat) do Electron spawn, có profile Chrome, cổng
+CDP và file cấu hình/phiên riêng.
 
 Giao thức (mỗi dòng một JSON):
 
@@ -26,21 +26,17 @@ import threading
 
 from bcr.adapters import browser as BR
 from bcr.controllers.baccarat import BaccaratController
-from bcr.controllers.longlong import LongLongController
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 GAMES = {
     # key: (cổng CDP, thư mục profile Chrome, file cấu hình/phiên)
     "baccarat": (9222, "chrome_profile", "bcr_state_baccarat.json"),
-    "longlong": (9223, "chrome_profile_longlong", "bcr_state_longlong.json"),
 }
-
 
 
 # Tên cũ của lớp controller: giữ alias để script/kiểm thử cũ vẫn chạy.
 BaccaratService = BaccaratController
-LongLongService = LongLongController
 
 
 class Emitter:
@@ -69,12 +65,9 @@ class Emitter:
 
 def build_service(game, emit, state_path):
     """Tạo controller đúng trò và bật vòng nền (nếu controller có)."""
-    if game == "longlong":
-        controller = LongLongController(state_path, emit)
-    elif game == "baccarat":
-        controller = BaccaratController(state_path, emit)
-    else:
+    if game != "baccarat":
         raise SystemExit("Trò không hỗ trợ: %s" % game)
+    controller = BaccaratController(state_path, emit)
     if hasattr(controller, "start"):
         controller.start()      # nhịp nền: đọc bàn/scan và báo Chrome đã đóng
     return controller
@@ -101,7 +94,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     port, profile, state_name = GAMES[args.game]
-    # Cách ly từng trò: đặt lại hằng số của adapter TRƯỚC khi tạo service.
+    # Đặt hằng số của adapter TRƯỚC khi tạo service (cổng/profile có thể bị ghi đè).
     BR.CDP_PORT = args.cdp_port or port
     BR.PROFILE_DIR = str(ROOT / (args.profile_dir or profile))
     state_path = pathlib.Path(args.state) if args.state else ROOT / state_name

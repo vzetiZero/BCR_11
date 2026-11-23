@@ -1,7 +1,7 @@
 @echo off
 rem =====================================================================
 rem  BCR - Mo ung dung (Electron Desktop)
-rem  Moi tro (Baccarat / LONG-LONG) chay 1 engine Python rieng.
+rem  Engine Python rieng (Chrome rieng, cau hinh rieng) cho tab Baccarat.
 rem =====================================================================
 setlocal EnableExtensions
 cd /d "%~dp0"

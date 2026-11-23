@@ -52,7 +52,7 @@ if errorlevel 1 (
 
 echo.
 echo [3/5] Kiem tra ma nguon BCR (MVC: models / adapters / controllers / service)
-%PY% -c "import bcr, bcr.service.engine, bcr.controllers.baccarat, bcr.controllers.longlong, bcr.models.longlong, bcr.models.live_sim, bcr.adapters.browser; print('      Module BCR OK')"
+%PY% -c "import bcr, bcr.service.engine, bcr.controllers.baccarat, bcr.models.live_sim, bcr.models.method, bcr.adapters.browser; print('      Module BCR OK')"
 if errorlevel 1 (
   echo [LOI] Khong import duoc module du an - thieu thu vien hoac file bi doi.
   pause

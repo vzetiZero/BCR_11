@@ -9,7 +9,7 @@ chạy nhanh; không bỏ qua bước nào.
 Khoá lại 5 điều:
 
     1. Chỉ một lệnh ``table.enterValid`` là đủ để đi từ sảnh tới đúng bàn đạt chuẩn.
-    2. Bàn không đạt bị loại, bàn Siêu Tốc Độ bị bỏ, bàn đạt được chọn.
+    2. Bàn chưa đủ số tay bị loại, bàn Siêu Tốc Độ bị bỏ, bàn đạt được chọn.
     3. Vào bàn xong thì ĐỨNG YÊN: không arm kế hoạch, không bấm chip, phiên chưa chạy.
     4. Bật tool sau đó mới chuyển sang theo dõi (và vẫn chờ hết tay hiện tại).
     5. Không có bàn đạt / quá hạn chờ thì báo rõ, không treo chế độ.
@@ -23,11 +23,11 @@ import unittest
 from bcr.controllers import baccarat as BA
 from bcr.service import engine
 
-# B 13 · P 9 (lệch 4), bệt tối đa 3, không có cầu 3-3 → đạt cả 5 điều kiện lọc.
+# 22 tay: đủ khoảng tay 10-50 nên đạt điều kiện vào bàn của phương pháp 1-1.
 GOOD = "".join(side * count for side, count in (
     ("B", 3), ("P", 2), ("B", 3), ("P", 2), ("B", 2), ("P", 3), ("B", 2), ("P", 2), ("B", 3)))
-# Bệt 6 tay liền ở đầu → vượt max_streak, phải bị loại.
-BET = "BBBBBB" + "PPBBPPBBPPBBPPBB" + "PPBB"
+# Chỉ 5 tay: dưới mức tối thiểu 10 tay nên phải bị loại.
+SHORT = "BBPPB"
 
 
 class FakeEmitter:
@@ -127,14 +127,14 @@ class EnterValidPipelineTests(unittest.TestCase):
 
     def test_one_button_goes_from_lobby_to_the_eligible_table(self):
         service = self.build([
-            tile("bet", "Bàn bệt", BET),
+            tile("short", "Bàn 5 tay", SHORT),
             tile("fast", "Bàn 7 Siêu Tốc Độ", GOOD),
             tile("ok", "Bàn 12", GOOD),
         ])
         reply = service.dispatch("table.enterValid", {})[0]
         self.assertTrue(reply["ok"], reply)
 
-        # Đọc sảnh xong phải bấm đúng bàn 12 (bỏ bàn bệt và bàn siêu tốc).
+        # Đọc sảnh xong phải bấm đúng bàn 12 (bỏ bàn thiếu tay và bàn siêu tốc).
         self.assertTrue(self.drain(service, lambda s: bool(s.stream.opened)))
         self.assertEqual(service.stream.opened, ["ok"], service.stream.opened)
         self.assertGreaterEqual(service.stream.sweeps, 1)
@@ -174,7 +174,7 @@ class EnterValidPipelineTests(unittest.TestCase):
         self.assertEqual(service.stream.opened, ["ok"])
 
     def test_no_eligible_table_keeps_hunting_instead_of_stopping(self):
-        service = self.build([tile("bet", "Bàn bệt", BET)])
+        service = self.build([tile("short", "Bàn 5 tay", SHORT)])
         service.enter_valid_table()
         self.assertTrue(self.drain(service, lambda s: s.stream.sweeps >= 2))
         self.assertEqual(service.stream.opened, [])
@@ -183,7 +183,7 @@ class EnterValidPipelineTests(unittest.TestCase):
         self.assertTrue(service.enter_valid, "vẫn đang tìm, chưa bỏ cuộc")
 
     def test_hitting_the_deadline_reports_and_stops(self):
-        service = self.build([tile("bet", "Bàn bệt", BET)])
+        service = self.build([tile("short", "Bàn 5 tay", SHORT)])
         service.enter_valid_table()
         service.enter_deadline = time.time() - 1
         service._tick()

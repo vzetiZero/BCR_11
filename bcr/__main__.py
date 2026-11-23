@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Cho phép chạy engine bằng ``python -m bcr --game baccarat|longlong``."""
+"""Cho phép chạy engine bằng ``python -m bcr --game baccarat``."""
 
 import sys
 

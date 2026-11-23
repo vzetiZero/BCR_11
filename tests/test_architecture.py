@@ -137,7 +137,7 @@ class StructureTests(unittest.TestCase):
                     "bcr/models/method.py", "bcr/models/money.py", "bcr/models/live_sim.py",
                     "bcr/adapters/browser.py", "bcr/adapters/lobby_stream.py",
                     "bcr/adapters/table_bets.py",
-                    "bcr/controllers/baccarat.py", "bcr/controllers/longlong.py",
+                    "bcr/controllers/baccarat.py",
                     "bcr/service/engine.py",
                     "README.md"):
             self.assertTrue((ROOT / rel).exists(), rel)
@@ -147,14 +147,14 @@ class StructureTests(unittest.TestCase):
                     "ui/renderer/index.html", "ui/renderer/app.js", "ui/renderer/styles.css"):
             self.assertTrue((ROOT / rel).exists(), rel)
 
-    def test_games_use_separate_ports_profiles_and_state_files(self):
+    def test_only_baccarat_is_registered(self):
         from bcr.service import engine
 
-        baccarat, longlong = engine.GAMES["baccarat"], engine.GAMES["longlong"]
-        self.assertNotEqual(baccarat[0], longlong[0], "mỗi trò một cổng CDP riêng")
-        self.assertNotEqual(baccarat[1], longlong[1], "mỗi trò một profile Chrome riêng")
-        self.assertNotEqual(baccarat[2], longlong[2], "mỗi trò một file trạng thái riêng")
-        self.assertEqual(pathlib.Path(baccarat[2]).parent, pathlib.Path("."))
+        self.assertEqual(sorted(engine.GAMES), ["baccarat"])
+        port, profile, state_file = engine.GAMES["baccarat"]
+        self.assertEqual(port, 9222)
+        self.assertEqual(profile, "chrome_profile")
+        self.assertEqual(pathlib.Path(state_file).parent, pathlib.Path("."))
 
     def test_main_module_exposes_the_engine_entry(self):
         text = (PKG / "__main__.py").read_text(encoding="utf-8")
@@ -162,24 +162,21 @@ class StructureTests(unittest.TestCase):
 
 
 class ControllerApiTests(unittest.TestCase):
-    def test_both_controllers_expose_dispatch_and_snapshot(self):
-        for module_name, class_name in (("bcr.controllers.baccarat", "BaccaratController"),
-                                        ("bcr.controllers.longlong", "LongLongController")):
-            module = importlib.import_module(module_name)
-            controller = getattr(module, class_name)
-            self.assertTrue(callable(getattr(controller, "dispatch", None)),
-                            "%s thiếu dispatch()" % class_name)
-            self.assertTrue(callable(getattr(controller, "snapshot", None)),
-                            "%s thiếu snapshot()" % class_name)
-            self.assertFalse(any(matches(name, ("tkinter",))
-                                 for name in imported_names(pathlib.Path(module.__file__))),
-                             "%s không được import tkinter" % class_name)
+    def test_the_controller_exposes_dispatch_and_snapshot(self):
+        module = importlib.import_module("bcr.controllers.baccarat")
+        controller = module.BaccaratController
+        self.assertTrue(callable(getattr(controller, "dispatch", None)),
+                        "BaccaratController thiếu dispatch()")
+        self.assertTrue(callable(getattr(controller, "snapshot", None)),
+                        "BaccaratController thiếu snapshot()")
+        self.assertFalse(any(matches(name, ("tkinter",))
+                             for name in imported_names(pathlib.Path(module.__file__))),
+                         "BaccaratController không được import tkinter")
 
-    def test_engine_keeps_the_legacy_class_aliases(self):
+    def test_engine_keeps_the_legacy_class_alias(self):
         from bcr.service import engine
 
         self.assertIs(engine.BaccaratService, engine.BaccaratController)
-        self.assertIs(engine.LongLongService, engine.LongLongController)
 
     def test_dispatch_reports_unknown_methods_without_raising(self):
         import pathlib as _path
@@ -210,8 +207,8 @@ class ElectronWiringTests(unittest.TestCase):
         self.assertIn("bcr.service.engine", main, "main.js spawn engine qua -m bcr.service.engine")
 
 
-class NoHorseRacingLeftoversTests(unittest.TestCase):
-    """Đua ngựa đã bị thay hẳn bằng LONG-LONG."""
+class NoRaceLeftoversTests(unittest.TestCase):
+    """Đua ngựa đã bị bỏ hẳn; chỉ còn Baccarat."""
 
     PATTERNS = (
         r"\bimport race\b", r"\bfrom bcr\.models import race\b", r"\brace\.",
@@ -231,6 +228,33 @@ class NoHorseRacingLeftoversTests(unittest.TestCase):
             for pattern in self.PATTERNS:
                 self.assertIsNone(re.search(pattern, text),
                                   "%s còn sót %r" % (path.relative_to(ROOT), pattern))
+
+
+class NoLongLongLeftoversTests(unittest.TestCase):
+    """Toàn bộ LONG-LONG (model/controller/adapter/service/UI/tài liệu) đã bị xoá."""
+
+    PATTERNS = (r"longlong", r"LONG-LONG", r"rng-longlong")
+
+    def test_no_longlong_reference_outside_tests(self):
+        files = [p for p in list(ROOT.glob("*.py")) + list(PKG.rglob("*.py"))
+                 + list((ROOT / "tools").rglob("*.py"))]
+        files += list(PKG.rglob("*.js")) + list((ROOT / "ui").rglob("*.js"))
+        files += list((ROOT / "ui").rglob("*.html")) + list((ROOT / "ui").rglob("*.css"))
+        files += list((ROOT / "ui").rglob("*.json"))
+        files += [ROOT / "README.md", ROOT / "install-toan-bo.bat", ROOT / "Start.bat"]
+        files = [p for p in files if p.exists()]
+        self.assertGreater(len(files), 10)
+        for path in files:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+            for pattern in self.PATTERNS:
+                self.assertIsNone(re.search(pattern, text, re.IGNORECASE),
+                                  "%s còn sót %r" % (path.relative_to(ROOT), pattern))
+
+    def test_longlong_modules_are_gone(self):
+        for rel in ("bcr/models/longlong.py", "bcr/controllers/longlong.py",
+                    "bcr/controllers/longlong_auto.py", "bcr/adapters/longlong_stream.py",
+                    "bcr/adapters/longlong_table.py"):
+            self.assertFalse((ROOT / rel).exists(), "%s phải bị xoá" % rel)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tầng Service (transport): engine JSON-RPC cho từng trò.
+"""Tầng Service (transport): engine JSON-RPC của app Baccarat.
 
-Electron spawn mỗi trò một tiến trình riêng (cổng CDP, profile Chrome, file phiên riêng).
+Electron spawn một tiến trình riêng (cổng CDP 9222, profile Chrome, file phiên riêng).
 """

@@ -21,7 +21,8 @@ def is_fast_table(label):
     return any(marker in text for marker in FAST_TABLE_MARKERS)
 
 def fresh_method():
-    return {"started": False, "ladder_step": 0, "hands_in_block": 0, "strong": None}
+    """Trạng thái phương pháp 1-1: cửa của tay kế tiếp + bậc gấp thếp hiện tại."""
+    return {"started": False, "ladder_step": 0, "side": E.BANKER}
 
 def signed(value):
     return ("+" if value > 0 else "") + M.fmt_money(value)
@@ -114,32 +115,17 @@ def table_is_clear(live):
     return True
 
 
-
 class LiveSimulation:
-    def __init__(self, book=None, profile=ME.DEFAULT_PROFILE, ladder=None,
-                 min_hands=ME.MIN_HANDS, max_hands=ME.MAX_HANDS,
-                 max_streak=ME.MAX_STREAK_ALLOWED,
-                 live_exit_streak=ME.DEFAULT_LIVE_EXIT_STREAK,
-                 min_lead=ME.DEFAULT_MIN_LEAD,
-                 block_mode=ME.BLOCK_MODE_RECALCULATE,
-                 max_lead=None, tie_side=ME.DEFAULT_TIE_SIDE, fixed_stake=0):
+    """Một phiên đánh theo phương pháp 1-1 xen kẽ B/P + gấp thếp theo bảng vốn."""
+
+    def __init__(self, book=None, ladder=None, min_hands=ME.MIN_HANDS,
+                 max_hands=ME.MAX_HANDS, live_exit_streak=ME.DEFAULT_LIVE_EXIT_STREAK,
+                 fixed_stake=0):
         self.money = book or M.MoneyBook()
-        self.profile = profile
-        self.ladder = ME.ladder_stakes(profile, ladder)
+        self.ladder = ME.ladder_stakes(ladder)
         self.fixed_stake = max(0.0, float(fixed_stake or 0))
         self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
-        self.max_streak = ME.normalize_streak(max_streak)
         self.live_exit_streak = ME.normalize_streak(live_exit_streak, ME.DEFAULT_LIVE_EXIT_STREAK)
-        self.min_lead = ME.normalize_min_lead(min_lead)
-        # Chặn hai đầu: lệch quá ít thì cầu dễ đổi, lệch quá nhiều thì cầu đã ngả hẳn.
-        self.max_lead = ME.normalize_max_lead(max_lead, None)
-        if self.max_lead is not None:
-            self.max_lead = max(self.min_lead, self.max_lead)
-        self.tie_side = ME.normalize_tie_side(tie_side)
-        self.block_mode = (ME.BLOCK_MODE_REPEAT if block_mode == "alternate" else block_mode)
-        self.block_mode = (self.block_mode if self.block_mode in
-                           (ME.BLOCK_MODE_RECALCULATE, ME.BLOCK_MODE_REPEAT)
-                           else ME.BLOCK_MODE_RECALCULATE)
         self.results = []
         self.log = []
         self.method_state = fresh_method()
@@ -150,64 +136,25 @@ class LiveSimulation:
         self.entry_waiting = False
         self.pending = None
         self.note = "Chọn bàn để theo dõi."
-        self.block_hands = 0
         self.place_skips = 0
         self.cycle_done = False
         self.filter_exit_done = False
-        # Chỉ rời bàn khi đã chạm mục tiêu lãi của phiên; hết một khối 3-3/3-2
+        # Chỉ rời bàn khi đã chạm mục tiêu lãi của phiên; hết một vòng gấp thếp
         # không còn là lý do rời bàn nữa.
         self.take_profit_done = False
         self.on_arm = None
 
-    @property
-    def cycle_hands(self):
-        """Số tay của một khối theo phương pháp đang chọn: 6 tay cho 3-3, 5 tay cho 3-2."""
-        return ME.block_hands(self.profile)
-
-    def set_method(self, profile, ladder):
-        self.profile = profile
-        self.ladder = ME.ladder_stakes(profile, ladder)
-
     def plan(self):
+        """Kế hoạch tay kế tiếp: cửa xen kẽ 1-1 + mức của bậc gấp thếp hiện tại."""
         s = self.method_state
         ladder_step = 0 if self.fixed_stake > 0 else s["ladder_step"]
-        plan = ME.plan(self.results, self.ladder, ladder_step, s["hands_in_block"],
-                       s["started"], s["strong"], self.profile,
-                       self.min_hands, self.max_hands, self.max_streak, self.block_mode,
-                       self.min_lead, max_lead=self.max_lead, tie_side=self.tie_side)
+        plan = ME.plan(self.results, self.ladder, ladder_step, s["side"], s["started"],
+                       self.min_hands, self.max_hands)
         if self.fixed_stake > 0 and plan.get("action") in ("start", "bet"):
             plan["stake"] = self.fixed_stake
             plan["ladder_step"] = 0
             plan["reason"] = "Mức cược cố định %s VN2 cho mỗi tay." % M.fmt_money(self.fixed_stake)
         return plan
-
-    def set_road_filter(self, min_hands, max_hands, max_streak, min_lead=ME.DEFAULT_MIN_LEAD):
-        """Đổi bộ lọc cầu (khoảng tay đã đi + số tay bệt tối đa); kẹp trong biên của method."""
-        self.min_hands, self.max_hands = ME.normalize_hand_range(min_hands, max_hands)
-        self.max_streak = ME.normalize_streak(max_streak)
-        self.min_lead = ME.normalize_min_lead(min_lead)
-        if self.max_lead is not None:
-            self.max_lead = max(self.min_lead, self.max_lead)
-        return self.min_hands, self.max_hands, self.max_streak, self.min_lead
-
-    def set_lead_range(self, min_lead=None, max_lead="__keep__"):
-        """Đổi khoảng chênh lệch B/P: tối thiểu (bỏ trống = giữ) và tối đa (None = không giới hạn)."""
-        if min_lead is not None:
-            self.min_lead = ME.normalize_min_lead(min_lead)
-        if max_lead != "__keep__":
-            self.max_lead = ME.normalize_max_lead(max_lead, None)
-        if self.max_lead is not None:
-            self.max_lead = max(self.min_lead, self.max_lead)
-        return self.min_lead, self.max_lead
-
-    def set_tie_side(self, tie_side):
-        """Khi B = P: 'B' (đỏ, mặc định), 'P' hoặc 'run' (theo vệt hiện tại)."""
-        self.tie_side = ME.normalize_tie_side(tie_side)
-        return self.tie_side
-
-    def set_live_exit_streak(self, live_exit_streak):
-        self.live_exit_streak = ME.normalize_streak(live_exit_streak, ME.DEFAULT_LIVE_EXIT_STREAK)
-        return self.live_exit_streak
 
     def bind(self, row):
         self.pause()
@@ -215,7 +162,6 @@ class LiveSimulation:
         self.letters = row["letters"]
         self.results = list(self.letters)
         self.method_state = fresh_method()
-        self.block_hands = 0
         self.place_skips = 0
         self.cycle_done = False
         self.filter_exit_done = False
@@ -322,8 +268,8 @@ class LiveSimulation:
     def _skip_unplaced_hand(self, letters, plan):
         """Tay có chữ mới nhưng chưa đặt được chip: chỉ ăn chữ vào cầu đang theo dõi.
 
-        Không đụng vốn, không đổi bậc cược, không tăng ``block_hands`` — phương pháp chỉ
-        tiến khi có cược thật. Kế hoạch cho tay kế tiếp được chốt lại trên cùng bậc.
+        Không đụng vốn, không đổi bậc cược, không đổi cửa — phương pháp chỉ tiến khi có
+        cược thật. Kế hoạch cho tay kế tiếp được chốt lại trên cùng bậc/cùng cửa.
         """
         reason = plan.get("place_note") or "không xác nhận được lượt đặt chip."
         if hasattr(self, "_trace"):
@@ -337,8 +283,7 @@ class LiveSimulation:
                              table_key=self.table_key,
                              hand=len(letters), result=letters[-1], bet=plan["side"], stake=0,
                              delta=0.0, outcome="not_placed", balance_after=self.money.balance,
-                             block_pos=plan.get("block_pos"), ladder=plan.get("ladder_step"),
-                             source="chip-not-placed"))
+                             ladder=plan.get("ladder_step"), source="chip-not-placed"))
         if self._exit_if_table_filter_failed(letters):
             return False
         if self.place_skips >= PLACE_SKIP_LIMIT:
@@ -355,12 +300,9 @@ class LiveSimulation:
     def _exit_if_table_filter_failed(self, letters):
         """Rời bàn đang chơi CHỈ khi bệt hiện tại chạm ngưỡng thoát trong bàn.
 
-        Khoảng 10-50 tay và luật "chưa từng có 3-3" là bộ lọc CHỌN bàn ở sảnh, không
-        phải điều kiện sống trong bàn. Áp lại chúng lên cầu live làm app bỏ một bàn
-        đang chơi bình thường ngay khi vượt quá ``max_hands`` hoặc vừa xuất hiện cầu
-        3-3 — đúng hiện tượng "vào bàn vài giây rồi bị đá" trong bcr_trace.jsonl.
-        Trong bàn chỉ còn ngưỡng thoát riêng (mặc định 7 tay bệt), khớp dòng cài đặt
-        "Trong bàn: thoát khi bệt đạt N tay".
+        Phương pháp 1-1 không phụ thuộc cầu nên không còn điều kiện "bàn phải đạt" áp
+        lên cầu live; chỉ giữ ngưỡng thoát riêng (mặc định 7 tay bệt) để tránh bàn đã
+        ngả hẳn một bên.
         """
         runs = E.run_lengths(letters)
         # Chỉ xét VỆT ĐANG CHẠY ở tay mới nhất (runs[-1]); dùng vệt dài nhất trong cả
@@ -455,21 +397,17 @@ class LiveSimulation:
         self.place_skips = 0
         result = letters[-1]
         settled = self.money.settle(plan["side"], result, plan["stake"], E.PAYOUT)
-        self.method_state, _ = ME.advance(self.method_state, result, plan["side"], plan["stake"],
-                                          self.profile)
+        self.method_state, _ = ME.advance(self.method_state, result, plan["side"], plan["stake"])
         if self.fixed_stake > 0:
             self.method_state["ladder_step"] = 0
-        self.method_state["strong"] = plan["strong"]
         self.letters = letters
         self.results = list(letters)
         self.log.append(dict(time=time.time(), armed_at=plan["armed_at"], table=self.table_name,
                              table_key=self.table_key,
                              hand=len(letters), result=result, bet=plan["side"], stake=plan["stake"],
                              delta=settled["delta"], outcome=settled["outcome"],
-                             balance_after=self.money.balance, block_pos=plan["block_pos"],
-                             ladder=plan["ladder_step"], source="live-driver"))
-        if result != E.TIE:
-            self.block_hands += 1
+                             balance_after=self.money.balance, ladder=plan.get("ladder_step"),
+                             source="live-driver"))
         if self.money.blocked:
             self.pause(self.money.blocked[1])
             if self.money.blocked[0] == "TAKE_PROFIT":
@@ -482,7 +420,7 @@ class LiveSimulation:
         else:
             if self._exit_if_table_filter_failed(letters):
                 return True
-            # Hết một khối 3-3/3-2 thì lặp khối tiếp theo ngay tại bàn này.
-            # method.plan() tự tính lại bên mạnh và reset vị trí trong khối.
+            # 1-1 chạy liên tục tại bàn: cửa tự đảo sau mỗi tay, bậc tự lên/xuống theo
+            # kết quả, nên chỉ cần chốt kế hoạch cho tay kế tiếp.
             self._arm()
         return True
