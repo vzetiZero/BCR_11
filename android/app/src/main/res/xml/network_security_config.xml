@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cấu hình mạng cho BCR.
+
+  Vì sao cho phép HTTP thường (cleartext):
+  các site mirror của nhà cái thường xuyên đổi tên miền và nhiều tên miền chỉ chạy HTTP,
+  không có HTTPS. Nếu chặn cleartext thì WebView trả lỗi và người dùng thấy
+  "trang web không khả dụng" dù link hoàn toàn đúng.
+
+  App này chỉ mở site do chính người dùng nhập, không gửi dữ liệu tới server nào khác,
+  nên cho phép cleartext là cần thiết để dùng được thực tế.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

@@ -136,6 +136,45 @@ class MainActivity : AppCompatActivity() {
         if (start.isBlank()) askSiteUrl() else webView.loadUrl(start)
     }
 
+    /** Ghi nhớ cặp URL đã đổi scheme, tránh vòng lặp đổi qua đổi lại vô hạn. */
+    private var lastFallbackKey: String? = null
+
+    /**
+     * Lỗi mạng nghĩa là "không nối được tới host/cổng", không phải "sai đường dẫn".
+     * Với các mã này ta thử lại bằng scheme còn lại (https ⇄ http).
+     */
+    private fun isConnectionError(code: Int): Boolean = when (code) {
+        android.webkit.WebViewClient.ERROR_HOST_LOOKUP,
+        android.webkit.WebViewClient.ERROR_CONNECT,
+        android.webkit.WebViewClient.ERROR_TIMEOUT,
+        android.webkit.WebViewClient.ERROR_IO,
+        android.webkit.WebViewClient.ERROR_UNKNOWN -> true
+        else -> false
+    }
+
+    /** Đổi scheme https ⇄ http, giữ nguyên host/cổng/đường dẫn. Trả null nếu không đổi được. */
+    private fun swapScheme(url: String): String? = when {
+        url.startsWith("https://") -> "http://" + url.removePrefix("https://")
+        url.startsWith("http://") -> "https://" + url.removePrefix("http://")
+        else -> null
+    }
+
+    /**
+     * Chuẩn hoá link người dùng dán: bỏ khoảng trắng, thêm https:// khi thiếu,
+     * kiểm tra host. Giữ nguyên scheme người dùng đã gõ (http hay https).
+     */
+    private fun normalizeUrl(raw: String): String? {
+        var text = raw.trim().replace(" ", "")
+        if (text.isEmpty()) return null
+        if (!text.startsWith("http://") && !text.startsWith("https://")) {
+            text = "https://" + text.removePrefix("//")
+        }
+        val parsed = runCatching { java.net.URI(text) }.getOrNull() ?: return null
+        val host = parsed.host ?: return null
+        if (host.isBlank() || !host.contains(".")) return null
+        return text
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun configure(view: WebView) {
         view.settings.apply {
@@ -181,15 +220,43 @@ class MainActivity : AppCompatActivity() {
                 error: android.webkit.WebResourceError
             ) {
                 super.onReceivedError(view, request, error)
-                // Chỉ báo lỗi của chính TRANG (không báo lỗi ảnh/quảng cáo trong trang).
+                // Chỉ xử lý lỗi của chính TRANG (không phải ảnh/quảng cáo trong trang).
                 if (!request.isForMainFrame) return
-                // Lỗi SSL/thanh chứng chỉ thì để nguyên nhân thật, không khuyên đổi link.
+                val failed = request.url?.toString().orEmpty()
+                val swapped = swapScheme(failed)
+                val code = runCatching { error.errorCode }.getOrDefault(0)
+
+                // "Connection refused" thường do SAI SCHEME: mirror của nhà cái hay chỉ chạy
+                // HTTP (cổng 80) trong khi app mặc định thêm https (cổng 443) → bị từ chối.
+                // Tự thử một lần bằng scheme còn lại trước khi báo lỗi.
+                if (swapped != null && isConnectionError(code) && lastFallbackKey != failed) {
+                    lastFallbackKey = failed
+                    view.loadUrl(swapped)
+                    return
+                }
+
                 val text = runCatching { error.description.toString() }.getOrNull().orEmpty()
                 panel.setSiteUrl(prefs.siteUrl)
-                toast(
-                    "Không mở được trang ($text).\n" +
-                        "Dán link khác vào ô \"Link site\" trong panel rồi bấm MỞ LINK."
-                )
+                val hint = if (isConnectionError(code)) {
+                    "Máy không nối được tới tên miền này.\n" +
+                        "• Link có thể đã chết — lấy link mới của site\n" +
+                        "• Nếu site cần VPN/proxy: bật lên rồi thử lại\n" +
+                        "• Dán link đầy đủ (có http:// hoặc https://) vào ô \"Link site\""
+                } else {
+                    "Dán link khác vào ô \"Link site\" trong panel rồi bấm MỞ LINK."
+                }
+                toast("Không mở được trang ($text).\n$hint")
+            }
+
+            override fun onReceivedSslError(
+                view: WebView,
+                handler: android.webkit.SslErrorHandler,
+                error: android.net.http.SslError
+            ) {
+                // Mirror của nhà cái rất hay dùng chứng chỉ tự ký hoặc sai tên miền.
+                // App chỉ mở site do chính người dùng nhập nên chấp nhận và đi tiếp,
+                // nếu không sẽ luôn ra "trang web không khả dụng".
+                handler.proceed()
             }
         }
         view.setBackgroundColor(Color.parseColor("#0B1220"))
@@ -250,19 +317,6 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton("Để sau", null)
             .show()
-    }
-
-    /** Chuẩn hoá link người dùng dán: thêm https:// khi thiếu, bỏ khoảng trắng, kiểm tra host. */
-    private fun normalizeUrl(raw: String): String? {
-        var text = raw.trim().replace(" ", "")
-        if (text.isEmpty()) return null
-        if (!text.startsWith("http://") && !text.startsWith("https://")) {
-            text = "https://" + text.removePrefix("//")
-        }
-        val parsed = runCatching { java.net.URI(text) }.getOrNull() ?: return null
-        val host = parsed.host ?: return null
-        if (host.isBlank() || !host.contains(".")) return null
-        return text
     }
 
     private fun dp(value: Int): Int =
